@@ -1,0 +1,70 @@
+"""Shared configuration, connection lifecycle, and JSON output."""
+from __future__ import annotations
+
+import base64
+import json
+import re
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import TYPE_CHECKING, Any, Iterator
+
+import psycopg
+import typer
+
+if TYPE_CHECKING:
+    from chronos_core.branching import ChronosBranchContext
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    database_url: str
+
+
+def database_config(ctx: typer.Context) -> DatabaseConfig:
+    database = ctx.find_object(DatabaseConfig)
+    if database is None or not database.database_url:
+        raise typer.BadParameter(
+            "Provide --database-url or set CHRONOS_DATABASE_URL.",
+            param_hint="--database-url",
+        )
+    return database
+
+
+def _json_default(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return {"encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
+    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}")
+
+
+def print_result(result: Any) -> None:
+    if result is not None:
+        typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2))
+
+
+@contextmanager
+def connect(database: DatabaseConfig) -> Iterator[ChronosBranchContext]:
+    from chronos_core.branching import BranchingError, ChronosBranchContext
+
+    try:
+        context = ChronosBranchContext.connect(database.database_url)
+        try:
+            yield context
+        finally:
+            context.close()
+    except (BranchingError, RuntimeError, sqlite3.Error, psycopg.Error, OSError, ValueError, TypeError) as error:
+        message = str(error)
+        if database.database_url:
+            message = message.replace(database.database_url, "<database>")
+        message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
+        message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
+        typer.echo(f"Error: {message}", err=True)
+        raise typer.Exit(1) from error
