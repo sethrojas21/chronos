@@ -166,14 +166,79 @@ input uses exit code 2. A merge preview may successfully return conflicts as dat
 merge application follows the API's rejection behavior. Errors do not emit a JSON
 success result.
 
-This first version uses the default interval backend with one database per
-invocation. Workspace coordination, a persistent interactive shell, advanced
-connection tuning, and custom Python merge callbacks are not exposed.
+The CLI uses the default interval backend with one relational data store per
+invocation. DuckDB uses a separate metadata store as described below. Workspace
+coordination, a persistent interactive shell, advanced connection tuning, and
+custom Python merge callbacks are not exposed.
+
+## DuckDB data with separate metadata
+
+DuckDB is an in-process SQL database designed for analytical queries such as
+aggregations and joins. The CLI opens a local DuckDB file; no DuckDB server or
+port is required. Chronos stores branch metadata separately in SQLite or
+PostgreSQL, using the existing `ChronosBranchContext.connect_split()` API.
+
+The native extension must be built with DuckDB enabled. Installing the Python
+`duckdb` package alone does not enable Chronos's native driver. On Linux x86-64,
+the build downloads the pinned DuckDB library:
+
+```sh
+uv sync --inexact --package chronos-core --reinstall-package chronos-core \
+  -Ccmake.define.CHRONOS_WITH_DUCKDB=ON
+```
+
+On macOS or other architectures, supply `-Ccmake.define.CHRONOS_DUCKDB_ROOT=PATH`
+with a directory containing `duckdb.h` and the compatible `libduckdb` library.
+The repository pins DuckDB 1.5.4 for its automatic Linux build. For example, after
+extracting the [official release's macOS universal library](https://github.com/duckdb/duckdb/releases/tag/v1.5.4) into
+`packages/chronos-core/build/duckdb-sdk`, rebuild with:
+
+```sh
+CMAKE_PREFIX_PATH="$(brew --prefix libpq)" \
+uv sync --inexact --package chronos-core --reinstall-package chronos-core \
+  -C "cmake.define.SQLite3_INCLUDE_DIR=$(brew --prefix sqlite)/include" \
+  -C "cmake.define.SQLite3_LIBRARY=$(brew --prefix sqlite)/lib/libsqlite3.dylib" \
+  -Ccmake.define.CHRONOS_WITH_DUCKDB=ON \
+  -C "cmake.define.CHRONOS_DUCKDB_ROOT=$PWD/packages/chronos-core/build/duckdb-sdk"
+```
+
+Use the same table, branch, query, checkpoint, diff, and merge commands with two
+connection URLs. Both databases must persist between one-off commands:
+
+```sh
+mkdir -p .chronos
+export CHRONOS_DATABASE_URL="duckdb:///$PWD/.chronos/analytics.duckdb"
+export CHRONOS_METADATA_URL="sqlite:///$PWD/.chronos/analytics-metadata.sqlite"
+
+uv run --no-sync --package chronos-core chronos table create \
+  'CREATE TABLE sales (id INTEGER PRIMARY KEY, amount BIGINT)'
+uv run --no-sync --package chronos-core chronos table register sales --primary-key id
+uv run --no-sync --package chronos-core chronos execute \
+  'INSERT INTO sales (id, amount) VALUES (1, 10), (2, 20)'
+uv run --no-sync --package chronos-core chronos branch create forecast
+uv run --no-sync --package chronos-core chronos execute \
+  'UPDATE sales SET amount = amount * 2' --branch forecast
+uv run --no-sync --package chronos-core chronos query \
+  'SELECT SUM(amount) AS total FROM sales' --branch forecast
+```
+
+The forecast totals 60 while `main` still totals 30. You can substitute a
+PostgreSQL URL for `CHRONOS_METADATA_URL`; no multi-store workspace is required.
+The explicit `--metadata-url` flag precedes the command name and overrides its
+environment variable, just like `--database-url`. Missing DuckDB metadata produces
+a usage error before connecting. An unavailable native driver produces the API's
+build-option error.
+
+Each invocation must use the same data/metadata pair to access the same branches.
+Unset `CHRONOS_METADATA_URL` when returning to the default single-database SQLite
+or PostgreSQL mode. This wrapper preserves the API's split-store semantics; it
+does not add cross-database transaction guarantees. DuckDB's normal file locking
+also applies, so use sequential invocations for this one-off CLI workflow.
 
 ## Test PostgreSQL locally
 
-The same relational commands work with SQLite and PostgreSQL. To run the CLI
-integration tests, start one disposable PostgreSQL server using Docker:
+The same relational commands work with SQLite, PostgreSQL, and DuckDB. To run the
+CLI integration tests, start one disposable PostgreSQL server using Docker:
 
 ```sh
 docker run --detach --rm --name chronos-cli-postgres-test \
@@ -207,10 +272,14 @@ resets the database named in the admin URL. No additional servers are started by
 pytest. Without the environment variable, PostgreSQL cases are reported as skips;
 an explicitly configured server that cannot be reached causes a test failure.
 
+A DuckDB-enabled build also runs the workflows with SQLite and PostgreSQL
+metadata independently. Without its native driver those cases are skipped. Set
+`CHRONOS_CLI_REQUIRE_DUCKDB=ON` to fail rather than skip if the driver is missing.
+
 The tests cover CLI-only setup, branch isolation, parameterized writes, SQL files
 and stdin, checkpoints, diffs, successful merges, conflicts, and rollback after a
-failed write. CI is configured to run these against the installed wheel on Python
-3.10 and 3.12.
+failed write. CI is configured to test the installed wheel on Python 3.10 and 3.12, with
+an additional DuckDB-enabled Python 3.12 build.
 
 `test_cli.py` checks command parsing, API arguments, errors, and entry points with
 fake connections. `test_cli_support.py` checks JSON conversion and cleanup.

@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Iterator
+from urllib.parse import urlsplit
 
 import psycopg
 import typer
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class DatabaseConfig:
     database_url: str
+    metadata_url: str | None = None
 
 
 def database_config(ctx: typer.Context) -> DatabaseConfig:
@@ -29,6 +31,11 @@ def database_config(ctx: typer.Context) -> DatabaseConfig:
         raise typer.BadParameter(
             "Provide --database-url or set CHRONOS_DATABASE_URL.",
             param_hint="--database-url",
+        )
+    if urlsplit(database.database_url).scheme == "duckdb" and not database.metadata_url:
+        raise typer.BadParameter(
+            "DuckDB requires --metadata-url or CHRONOS_METADATA_URL for SQLite or PostgreSQL metadata.",
+            param_hint="--metadata-url",
         )
     return database
 
@@ -55,15 +62,19 @@ def connect(database: DatabaseConfig) -> Iterator[ChronosBranchContext]:
     from chronos_core.branching import BranchingError, ChronosBranchContext
 
     try:
-        context = ChronosBranchContext.connect(database.database_url)
+        if database.metadata_url is None:
+            context = ChronosBranchContext.connect(database.database_url)
+        else:
+            context = ChronosBranchContext.connect_split(database.database_url, database.metadata_url)
         try:
             yield context
         finally:
             context.close()
     except (BranchingError, RuntimeError, sqlite3.Error, psycopg.Error, OSError, ValueError, TypeError) as error:
         message = str(error)
-        if database.database_url:
-            message = message.replace(database.database_url, "<database>")
+        for url in (database.database_url, database.metadata_url):
+            if url:
+                message = message.replace(url, "<database>")
         message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
         message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
         typer.echo(f"Error: {message}", err=True)

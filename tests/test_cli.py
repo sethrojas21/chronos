@@ -23,6 +23,7 @@ def connection(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     database.checkout.return_value.__enter__.return_value.query.return_value = []
     monkeypatch.setattr(ChronosBranchContext, "connect", MagicMock(return_value=database))
     monkeypatch.delenv("CHRONOS_DATABASE_URL", raising=False)
+    monkeypatch.delenv("CHRONOS_METADATA_URL", raising=False)
     return database
 
 
@@ -144,6 +145,7 @@ def test_installed_entrypoints() -> None:
     for args in ([str(executable), "--help"], [sys.executable, "-m", "chronos_core.cli", "--help"]):
         env = dict(os.environ)
         env.pop("CHRONOS_DATABASE_URL", None)
+        env.pop("CHRONOS_METADATA_URL", None)
         result = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
         assert result.returncode == 0, result.stderr
         assert "--database-url" in result.stdout
@@ -181,3 +183,51 @@ def test_native_error_is_reported_without_traceback(connection: MagicMock) -> No
     assert result.stderr.strip() == "Error: INSERT must specify a column list"
     connection.checkout.return_value.__exit__.assert_called_once()
     connection.close.assert_called_once()
+
+
+@pytest.mark.parametrize("source", ["flag", "environment", "override"])
+def test_split_connection_configuration(connection: MagicMock, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    split = MagicMock(return_value=connection)
+    monkeypatch.setattr(ChronosBranchContext, "connect_split", split)
+    args = ["--database-url", "duckdb:////tmp/data.duckdb"]
+    environment = {}
+    if source != "flag":
+        environment["CHRONOS_METADATA_URL"] = "sqlite:////tmp/env.sqlite"
+    if source != "environment":
+        args.extend(["--metadata-url", "sqlite:////tmp/flag.sqlite"])
+    result = runner.invoke(app, [*args, "branch", "list"], env=environment)
+    assert result.exit_code == 0, result.output
+    expected_metadata = "sqlite:////tmp/env.sqlite" if source == "environment" else "sqlite:////tmp/flag.sqlite"
+    split.assert_called_once_with("duckdb:////tmp/data.duckdb", expected_metadata)
+    ChronosBranchContext.connect.assert_not_called()
+    connection.close.assert_called_once()
+
+
+def test_duckdb_requires_metadata_before_connecting(connection: MagicMock) -> None:
+    result = runner.invoke(app, ["--database-url", "duckdb:////tmp/data.duckdb", "branch", "list"])
+    assert result.exit_code == 2
+    assert "--metadata-url" in result.output
+    ChronosBranchContext.connect.assert_not_called()
+
+
+def test_split_connection_redacts_metadata_credentials(connection: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = "postgresql://user:secret@localhost/metadata"
+    split = MagicMock(side_effect=ValueError(f"Cannot connect to {metadata}"))
+    monkeypatch.setattr(ChronosBranchContext, "connect_split", split)
+    result = runner.invoke(app, ["--database-url", "duckdb:////tmp/data.duckdb",
+                                 "--metadata-url", metadata, "branch", "list"])
+    assert result.exit_code == 1
+    assert "secret" not in result.output
+    assert "<database>" in result.stderr
+    connection.close.assert_not_called()
+
+
+def test_unavailable_duckdb_driver_reports_api_error(connection: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    split = MagicMock(side_effect=RuntimeError("DuckDB support requires CHRONOS_WITH_DUCKDB=ON"))
+    monkeypatch.setattr(ChronosBranchContext, "connect_split", split)
+    result = runner.invoke(app, ["--database-url", "duckdb:////tmp/data.duckdb",
+                                 "--metadata-url", "sqlite:////tmp/metadata.sqlite", "branch", "list"])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "CHRONOS_WITH_DUCKDB=ON" in result.stderr
+    connection.close.assert_not_called()

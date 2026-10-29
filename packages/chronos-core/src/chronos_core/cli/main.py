@@ -35,8 +35,12 @@ def main(
     database_url: str | None = typer.Option(
         None, "--database-url", envvar="CHRONOS_DATABASE_URL", help="Database connection URL."
     ),
+    metadata_url: str | None = typer.Option(
+        None, "--metadata-url", envvar="CHRONOS_METADATA_URL",
+        help="Separate SQLite or PostgreSQL metadata URL; required for DuckDB.",
+    ),
 ) -> None:
-    ctx.obj = DatabaseConfig(database_url) if database_url else None
+    ctx.obj = DatabaseConfig(database_url, metadata_url) if database_url else None
 
 
 @branch_app.command("list")

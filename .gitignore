@@ -28,9 +28,11 @@ dist/
 # Generated benchmark output
 .benchmarks/
 
-# Generated SQLite databases and journal files
+# Generated local databases and journal files
 *.sqlite
 *.sqlite-*
+*.duckdb
+*.duckdb.wal
 
 # Literal local workspace state directory
 /$state/

@@ -15,16 +15,22 @@ import psycopg
 import pytest
 from psycopg import sql as postgres_sql
 
-from chronos_core.branching import ChronosBranchContext
+from chronos_core import _native_interval
+from chronos_core.cli._support import DatabaseConfig
 
 
 def _invoke_cli(
-    database_url: str, *args: str, ok: bool = True, input_text: str | None = None,
+    database: DatabaseConfig, *args: str, ok: bool = True, input_text: str | None = None,
 ) -> Any:
+    connection_args = ["--database-url", database.database_url]
+    if database.metadata_url is not None:
+        connection_args.extend(["--metadata-url", database.metadata_url])
+    environment = dict(os.environ)
+    environment.pop("CHRONOS_METADATA_URL", None)
     result = subprocess.run(
         [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli",
-         "--database-url", database_url, *args],
-        input=input_text, capture_output=True, text=True, timeout=30,
+         *connection_args, *args],
+        input=input_text, capture_output=True, text=True, timeout=30, env=environment,
     )
     assert result.returncode == (0 if ok else 1), result.stderr
     if not ok:
@@ -53,29 +59,33 @@ def postgres_cli_database_url() -> Iterator[str]:
             )
 
 
-@pytest.fixture(params=["sqlite", "postgres"])
-def cli_database_url(request: pytest.FixtureRequest, tmp_path: Path) -> str:
-    if request.param == "sqlite":
-        return f"sqlite:///{tmp_path / 'workflow.sqlite'}"
+@pytest.fixture(params=["sqlite", "postgres", "duckdb-sqlite", "duckdb-postgres"])
+def cli_database(request: pytest.FixtureRequest, tmp_path: Path) -> DatabaseConfig:
+    kind = request.param
+    if kind.startswith("duckdb") and not _native_interval.has_duckdb:
+        if os.environ.get("CHRONOS_CLI_REQUIRE_DUCKDB") == "ON":
+            pytest.fail("The CLI test matrix requires a DuckDB-enabled native build")
+        pytest.skip("DuckDB disabled in this native build")
+    if kind == "sqlite":
+        return DatabaseConfig(f"sqlite:///{tmp_path / 'workflow.sqlite'}")
+    if kind == "duckdb-sqlite":
+        return DatabaseConfig(
+            f"duckdb:///{tmp_path / 'workflow.duckdb'}",
+            f"sqlite:///{tmp_path / 'metadata.sqlite'}",
+        )
     url = request.getfixturevalue("postgres_cli_database_url")
     # This URL belongs only to the database created by our session fixture.
     with psycopg.connect(url, autocommit=True, connect_timeout=10) as database:
         database.execute("DROP SCHEMA public CASCADE")
         database.execute("CREATE SCHEMA public")
-    return url
+    return DatabaseConfig(
+        f"duckdb:///{tmp_path / 'workflow.duckdb'}", url,
+    ) if kind == "duckdb-postgres" else DatabaseConfig(url)
 
 
-def test_relational_workflow(cli_database_url: str) -> None:
-    url = cli_database_url
-    database = ChronosBranchContext.connect(url)
-    try:
-        database.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
-        database.db.commit()
-    finally:
-        database.close()
-
-    invoke = partial(_invoke_cli, url)
-
+def test_relational_workflow(cli_database: DatabaseConfig) -> None:
+    invoke = partial(_invoke_cli, cli_database)
+    invoke("table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
     assert invoke("table", "register", "items", "--primary-key", "id") is None
     assert invoke("branch", "create", "trial") is None
     invoke("branch", "create", "trial", ok=False)
@@ -105,10 +115,8 @@ def test_relational_workflow(cli_database_url: str) -> None:
     assert [branch["branch_id"] for branch in invoke("branch", "list")] == ["main"]
 
 
-def test_cli_only_setup(cli_database_url: str) -> None:
-    url = cli_database_url
-
-    invoke = partial(_invoke_cli, url)
+def test_cli_only_setup(cli_database: DatabaseConfig) -> None:
+    invoke = partial(_invoke_cli, cli_database)
 
     assert invoke("table", "create",
                   "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)") is None
@@ -123,8 +131,8 @@ def test_cli_only_setup(cli_database_url: str) -> None:
     assert invoke("query", "SELECT * FROM items") == [{"id": 1, "value": "hello"}]
 
 
-def test_relational_sql_inputs_and_rollback(cli_database_url: str, tmp_path: Path) -> None:
-    invoke = partial(_invoke_cli, cli_database_url)
+def test_relational_sql_inputs_and_rollback(cli_database: DatabaseConfig, tmp_path: Path) -> None:
+    invoke = partial(_invoke_cli, cli_database)
     statement = tmp_path / "statement.sql"
     statement.write_text(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", encoding="utf-8",
@@ -150,3 +158,22 @@ def test_relational_sql_inputs_and_rollback(cli_database_url: str, tmp_path: Pat
         {"id": 1, "value": "updated"},
     ]
 
+
+
+def test_relational_aggregation(cli_database: DatabaseConfig) -> None:
+    invoke = partial(_invoke_cli, cli_database)
+    invoke("table", "create", "CREATE TABLE sales (id INTEGER PRIMARY KEY, category TEXT, amount BIGINT)")
+    invoke("table", "register", "sales", "--primary-key", "id")
+    invoke("execute", "INSERT INTO sales (id, category, amount) VALUES (1, 'books', 10), (2, 'books', 20), (3, 'games', 50)")
+    invoke("branch", "create", "forecast")
+    invoke("execute", "UPDATE sales SET amount = amount * :factor WHERE category = :category",
+           "--branch", "forecast", "--params", '{"factor": 2, "category": "books"}')
+    query = "SELECT category, SUM(amount) AS total FROM sales GROUP BY category ORDER BY category"
+    # PostgreSQL SUM(BIGINT) returns NUMERIC, serialized as a precision-preserving string.
+    total = str if urlsplit(cli_database.database_url).scheme in {"postgres", "postgresql"} else int
+    assert invoke("query", query) == [
+        {"category": "books", "total": total(30)}, {"category": "games", "total": total(50)},
+    ]
+    assert invoke("query", query, "--branch", "forecast") == [
+        {"category": "books", "total": total(60)}, {"category": "games", "total": total(50)},
+    ]
