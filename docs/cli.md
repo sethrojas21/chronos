@@ -169,3 +169,58 @@ success result.
 This first version uses the default interval backend with one database per
 invocation. Workspace coordination, a persistent interactive shell, advanced
 connection tuning, and custom Python merge callbacks are not exposed.
+
+## Test PostgreSQL locally
+
+The same relational commands work with SQLite and PostgreSQL. To run the CLI
+integration tests, start one disposable PostgreSQL server using Docker:
+
+```sh
+docker run --detach --rm --name chronos-cli-postgres-test \
+  -e POSTGRES_PASSWORD=chronos_test \
+  -p 127.0.0.1:55434:5432 \
+  --health-cmd 'pg_isready -U postgres' \
+  --health-interval 1s --health-timeout 3s --health-retries 30 \
+  postgres:16-alpine
+
+docker inspect --format '{{.State.Health.Status}}' chronos-cli-postgres-test
+```
+
+Wait until the health status is `healthy`. Port `55434` on your computer forwards
+to PostgreSQL's port `5432` inside the container; it is bound only to localhost.
+This port must be free before starting the container. Reuse the existing
+container if you already started it; do not start one per test.
+
+With the package and pytest installed in your environment, run from the
+repository root:
+
+```sh
+CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL=postgresql://postgres:chronos_test@127.0.0.1:55434/postgres \
+  uv run --no-sync --package chronos-core python -m pytest \
+  tests/test_cli.py tests/test_cli_support.py tests/test_cli_integration.py -v
+```
+
+The PostgreSQL account must have permission to create and drop databases. The
+test session creates one uniquely named test database and reuses it, clearing its
+`public` schema between cases. It drops that database on completion and never
+resets the database named in the admin URL. No additional servers are started by
+pytest. Without the environment variable, PostgreSQL cases are reported as skips;
+an explicitly configured server that cannot be reached causes a test failure.
+
+The tests cover CLI-only setup, branch isolation, parameterized writes, SQL files
+and stdin, checkpoints, diffs, successful merges, conflicts, and rollback after a
+failed write. CI is configured to run these against the installed wheel on Python
+3.10 and 3.12.
+
+`test_cli.py` checks command parsing, API arguments, errors, and entry points with
+fake connections. `test_cli_support.py` checks JSON conversion and cleanup.
+`test_cli_integration.py` runs real CLI processes against SQLite and PostgreSQL.
+
+Stop the disposable server when finished:
+
+```sh
+docker stop chronos-cli-postgres-test
+```
+
+Because the container uses `--rm`, stopping it removes the container and its
+temporary database storage. No Docker volume is retained for this test server.

@@ -139,53 +139,6 @@ def test_connection_failure_does_not_close_unassigned_context(connection: MagicM
     connection.close.assert_not_called()
 
 
-
-def test_sqlite_workflow(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path / 'workflow.db'}"
-    database = ChronosBranchContext.connect(url)
-    try:
-        database.db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
-        database.db.commit()
-    finally:
-        database.close()
-
-    def invoke(*args: str, ok: bool = True):
-        result = subprocess.run(
-            [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli", "--database-url", url, *args],
-            capture_output=True, text=True, timeout=30,
-        )
-        assert result.returncode == (0 if ok else 1), result.stderr
-        return json.loads(result.stdout) if result.stdout.strip() else None
-
-    assert invoke("table", "register", "items", "--primary-key", "id") is None
-    assert invoke("branch", "create", "trial") is None
-    invoke("branch", "create", "trial", ok=False)
-    assert {branch["branch_id"] for branch in invoke("branch", "list")} == {"main", "trial"}
-    assert invoke("execute", "INSERT INTO items (id, value) VALUES (:id, :value)", "--branch", "trial",
-                  "--params", '{"id": 1, "value": "hello"}') == {"rowcount": 1}
-    assert invoke("query", "SELECT * FROM items", "--branch", "trial") == [{"id": 1, "value": "hello"}]
-    assert invoke("query", "SELECT * FROM items") == []
-    assert invoke("checkpoint", "create", "saved", "--branch", "trial")["checkpoint_id"] == "saved"
-    assert len(invoke("checkpoint", "list", "--branch", "trial")) == 1
-    assert len(invoke("diff", "main", "trial")["changes"]) == 1
-    assert len(invoke("diff", "main", "trial", "--table", "items")) == 1
-    assert invoke("merge", "preview", "trial", "main")["conflicts"] == []
-    assert invoke("merge", "apply", "trial", "main")["applied"] == 1
-    assert invoke("query", "SELECT * FROM items") == [{"id": 1, "value": "hello"}]
-    invoke("branch", "create", "conflicting")
-    invoke("execute", "UPDATE items SET value = 'source' WHERE id = 1", "--branch", "conflicting")
-    invoke("execute", "UPDATE items SET value = 'target' WHERE id = 1")
-    assert len(invoke("merge", "preview", "conflicting", "main")["conflicts"]) == 1
-    invoke("merge", "apply", "conflicting", "main", ok=False)
-    invoke("merge", "apply", "conflicting", "main", "--policy", "snapshot_isolation", ok=False)
-    assert invoke("query", "SELECT value FROM items") == [{"value": "target"}]
-    invoke("branch", "delete", "conflicting")
-    invoke("query", "SELECT * FROM items", "--branch", "missing", ok=False)
-    invoke("execute", "DROP TABLE items", ok=False)
-    assert invoke("branch", "delete", "trial") is None
-    assert [branch["branch_id"] for branch in invoke("branch", "list")] == ["main"]
-
-
 def test_installed_entrypoints() -> None:
     executable = Path(sys.executable).parent / "chronos"
     for args in ([str(executable), "--help"], [sys.executable, "-m", "chronos_core.cli", "--help"]):
@@ -228,27 +181,3 @@ def test_native_error_is_reported_without_traceback(connection: MagicMock) -> No
     assert result.stderr.strip() == "Error: INSERT must specify a column list"
     connection.checkout.return_value.__exit__.assert_called_once()
     connection.close.assert_called_once()
-
-
-def test_cli_only_sqlite_setup(tmp_path: Path) -> None:
-    url = f"sqlite:///{tmp_path / 'cli-only.sqlite'}"
-
-    def invoke(*args: str):
-        result = subprocess.run(
-            [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli", "--database-url", url, *args],
-            capture_output=True, text=True, timeout=30,
-        )
-        assert result.returncode == 0, result.stderr
-        return json.loads(result.stdout) if result.stdout.strip() else None
-
-    assert invoke("table", "create",
-                  "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)") is None
-    invoke("table", "register", "items", "--primary-key", "id")
-    invoke("branch", "create", "experiment")
-    assert invoke("execute", "INSERT INTO items (id, value) VALUES (1, 'hello')",
-                  "--branch", "experiment") == {"rowcount": 1}
-    assert invoke("query", "SELECT * FROM items", "--branch", "experiment") == [{"id": 1, "value": "hello"}]
-    assert invoke("query", "SELECT * FROM items") == []
-    assert len(invoke("diff", "main", "experiment")["changes"]) == 1
-    assert invoke("merge", "apply", "experiment", "main")["applied"] == 1
-    assert invoke("query", "SELECT * FROM items") == [{"id": 1, "value": "hello"}]

@@ -63,6 +63,18 @@ jobs:
           PYTHONPATH=examples/verl python -m pytest examples/verl/test_e2b_episode.py -q
   wheel:
     runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     strategy:
       matrix:
         python: ['3.10', '3.12']
@@ -81,3 +93,9 @@ jobs:
         run: |
           python -I -m pytest tests/test_build_features.py tests/test_native_interval.py tests/test_interval_allocator.py tests/test_checkpoint_forks.py tests/test_reused_session_transactions.py -k 'not postgres' -q --timeout=60
           python -I examples/single_store_branching.py
+      - name: Test the installed CLI against SQLite and PostgreSQL
+        env:
+          CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          python -I -m pytest tests/test_cli.py tests/test_cli_support.py \
+            tests/test_cli_integration.py -q --timeout=60
