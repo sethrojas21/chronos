@@ -87,21 +87,26 @@ GatewayConfig load_config(const std::string &path) {
     const auto &listeners = root.at("listeners");
     config.control = parse_address(listeners.at("control").get<std::string>(), "control listener");
     config.postgres = parse_address(listeners.at("postgres").get<std::string>(), "postgres listener");
-    config.nfs = parse_address(listeners.at("nfs").get<std::string>(), "nfs listener");
-    const auto &nfs = root.at("nfs");
-    config.nfs_runtime.ganesha_library = nfs.at("ganesha_library").get<std::string>();
-    config.nfs_runtime.plugins_directory = nfs.at("plugins_directory").get<std::string>();
-    config.nfs_runtime.state_directory = nfs.at("state_directory").get<std::string>();
-    config.nfs_runtime.mountpoint = nfs.value(
-        "mountpoint", config.nfs_runtime.state_directory + "/mount");
-    for (const auto &[label, value] : std::vector<std::pair<std::string, std::string>>{
-             {"ganesha_library", config.nfs_runtime.ganesha_library},
-             {"plugins_directory", config.nfs_runtime.plugins_directory},
-             {"state_directory", config.nfs_runtime.state_directory},
-             {"mountpoint", config.nfs_runtime.mountpoint}}) {
-        if (value.empty() || value.find_first_of("\r\n{};") != std::string::npos) {
-            throw GatewayError("nfs " + label + " is empty or contains unsafe characters");
+    config.nfs_enabled = listeners.contains("nfs");
+    if (config.nfs_enabled) {
+        config.nfs = parse_address(listeners.at("nfs").get<std::string>(), "nfs listener");
+        const auto &nfs = root.at("nfs");
+        config.nfs_runtime.ganesha_library = nfs.at("ganesha_library").get<std::string>();
+        config.nfs_runtime.plugins_directory = nfs.at("plugins_directory").get<std::string>();
+        config.nfs_runtime.state_directory = nfs.at("state_directory").get<std::string>();
+        config.nfs_runtime.mountpoint = nfs.value(
+            "mountpoint", config.nfs_runtime.state_directory + "/mount");
+        for (const auto &[label, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"ganesha_library", config.nfs_runtime.ganesha_library},
+                 {"plugins_directory", config.nfs_runtime.plugins_directory},
+                 {"state_directory", config.nfs_runtime.state_directory},
+                 {"mountpoint", config.nfs_runtime.mountpoint}}) {
+            if (value.empty() || value.find_first_of("\r\n{};") != std::string::npos) {
+                throw GatewayError("nfs " + label + " is empty or contains unsafe characters");
+            }
         }
+    } else if (root.contains("nfs")) {
+        throw GatewayError("nfs settings require an nfs listener");
     }
     config.controller_token = required_env(
         root.value("controller_token_env", std::string("CHRONOS_CONTROLLER_TOKEN")));
@@ -138,6 +143,9 @@ GatewayConfig load_config(const std::string &path) {
                 ? shared_metadata
                 : std::move(parsed_store.metadata_url);
             fs.block_size = filesystem.value("block_size", 1024 * 1024);
+            if (!config.nfs_enabled) {
+                throw GatewayError("workspace " + workspace.key() + " has a filesystem but no nfs listener is configured");
+            }
             parsed.filesystem = std::move(fs);
         }
         config.workspaces.emplace(workspace.key(), std::move(parsed));

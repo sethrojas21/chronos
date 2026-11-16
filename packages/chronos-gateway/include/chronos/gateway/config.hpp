@@ -18,6 +18,9 @@ struct ListenAddress {
 struct GatewayConfig {
     ListenAddress control;
     ListenAddress postgres;
+    // Without an nfs listener the gateway serves only control and PostgreSQL;
+    // no workspace may then configure a filesystem.
+    bool nfs_enabled = true;
     ListenAddress nfs;
     struct NfsRuntime {
         std::string ganesha_library;

@@ -80,6 +80,33 @@ int main() {
               "sqlite:///metadata.sqlite",
           "workspace metadata URL must apply to database stores");
 
+    // A SQL-only gateway omits the nfs listener and settings; a filesystem then
+    // cannot be configured.
+    {
+        std::ofstream output(path);
+        output << R"JSON({
+  "listeners": {"control": "127.0.0.1:17400", "postgres": "127.0.0.1:15432"},
+  "controller_token_env": "TEST_GATEWAY_TOKEN",
+  "workspaces": {"agents": {"metadata_url_env": "TEST_METADATA_URL",
+                            "postgres": {"app": {"data_url_env": "TEST_ORDERS_URL"}}}}
+})JSON";
+    }
+    auto sql_only = load_config(path);
+    check(!sql_only.nfs_enabled, "a config without an nfs listener must disable NFS");
+    check(sql_only.workspaces.at("agents").postgres_stores.count("app") == 1,
+          "a SQL-only workspace must parse");
+    {
+        std::ofstream output(path);
+        output << R"JSON({
+  "listeners": {"control": "127.0.0.1:17400", "postgres": "127.0.0.1:15432"},
+  "controller_token_env": "TEST_GATEWAY_TOKEN",
+  "workspaces": {"agents": {"metadata_url_env": "TEST_METADATA_URL",
+                            "filesystem": {"data_url_env": "TEST_FILES_URL"}}}
+})JSON";
+    }
+    rejects([&] { load_config(path); }, "a filesystem without an nfs listener must fail clearly");
+    check(config.nfs_enabled, "a config with an nfs listener must enable NFS");
+
     write_config(path, "0.0.0.0:17400");
     rejects([&] { load_config(path); }, "plaintext wildcard listeners must fail closed");
     unsetenv("TEST_GATEWAY_TOKEN");

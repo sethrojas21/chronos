@@ -11,6 +11,7 @@
 #include <chrono>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -61,8 +62,8 @@ int main(int argc, char **argv) {
                 config.nfs,
                 config.controller_token);
             chronos::gateway::PostgresServer postgres_server(runtime, config.postgres);
-            chronos::gateway::NfsServer nfs_server(
-                runtime, config.nfs, config.nfs_runtime);
+            std::optional<chronos::gateway::NfsServer> nfs_server;
+            if (config.nfs_enabled) nfs_server.emplace(runtime, config.nfs, config.nfs_runtime);
             std::signal(SIGINT, stop_server);
             std::signal(SIGTERM, stop_server);
             std::mutex failure_mutex;
@@ -81,7 +82,7 @@ int main(int argc, char **argv) {
             };
             std::thread control_thread([&] { run(server); });
             std::thread postgres_thread([&] { run(postgres_server); });
-            std::thread nfs_thread([&] { run(nfs_server); });
+            std::thread nfs_thread([&] { if (nfs_server) run(*nfs_server); });
             while (!stop_requested && !service_failed.load()) {
                 runtime.expire_due();
                 runtime.reclaim_due();
@@ -92,7 +93,7 @@ int main(int argc, char **argv) {
             }
             server.stop();
             postgres_server.stop();
-            nfs_server.stop();
+            if (nfs_server) nfs_server->stop();
             control_thread.join();
             postgres_thread.join();
             nfs_thread.join();
