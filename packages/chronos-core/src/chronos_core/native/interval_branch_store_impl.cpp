@@ -2410,9 +2410,12 @@
         // four versioning columns used by every relational data plane:
         // live_lo/live_hi bound row visibility, writer_segment_id identifies
         // the writer for diff/merge, and deleted stores logical tombstones.
+        std::vector<std::string> physical_defs;
+        physical_defs.reserve(column_defs.size());
+        for (const auto &definition : column_defs) physical_defs.push_back(physical_column_def(definition));
         std::string sql =
             "CREATE TABLE " + quote_ident(physical) + " ("
-            + join_strings(column_defs, ", ") +
+            + join_strings(physical_defs, ", ") +
             ", live_lo " + interval_sql_type() + " NOT NULL"
             ", live_hi " + physical_live_hi_sql_type() + " NOT NULL"
             ", writer_segment_id INTEGER NOT NULL"

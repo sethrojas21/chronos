@@ -107,6 +107,7 @@ class NativeBranchSessionImpl {
         bool deleted
     ) {
         if (rows.empty()) return;
+        if (!deleted) require_not_null(logical_table, columns, rows);
         bool metadata_guard = false;
         const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         const bool started_data_tx = !store_.driver().in_transaction();
@@ -145,6 +146,7 @@ class NativeBranchSessionImpl {
         bool ignore_conflicts
     ) {
         if (rows.empty()) return 0;
+        require_not_null(logical_table, columns, rows);
         bool metadata_guard = false;
         const bool statement_guard = acquire_write_guard_for_statement(metadata_guard);
         const bool started_data_tx = !store_.driver().in_transaction();
@@ -1104,15 +1106,29 @@ class NativeBranchSessionImpl {
         std::vector<std::string> columns;
         std::vector<std::string> defs;
         std::vector<std::string> pk_columns;
+        std::vector<std::string> table_pk_columns;
         for (std::size_t i = 0; i < stmt->n_table_elts; ++i) {
             PgQuery__Node *node = stmt->table_elts[i];
+            if (node && node->node_case == PG_QUERY__NODE__NODE_CONSTRAINT && node->constraint) {
+                table_pk_columns = table_primary_key_columns(node->constraint, table_pk_columns);
+                continue;
+            }
             if (!node || node->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF || !node->column_def) {
                 throw std::runtime_error("unsupported native branch schema statement");
             }
             column_def_parts(node->column_def, true, columns, defs, pk_columns);
         }
+        if (!table_pk_columns.empty()) {
+            if (!pk_columns.empty()) throw std::runtime_error("multiple primary keys for table " + table);
+            for (const auto &column : table_pk_columns) {
+                if (std::find(columns.begin(), columns.end(), column) == columns.end()) {
+                    throw std::runtime_error("primary key column does not exist: " + column);
+                }
+            }
+            pk_columns = table_pk_columns;
+        }
         if (pk_columns.empty()) {
-            throw std::runtime_error("CREATE TABLE requires an inline primary key");
+            throw std::runtime_error("CREATE TABLE requires a primary key");
         }
         const std::string physical = store_.physical_schema_table_name(table);
         store_.create_interval_physical_table(
@@ -1364,6 +1380,49 @@ class NativeBranchSessionImpl {
         return join_strings(parts, ".");
     }
 
+    // The columns of a table-level PRIMARY KEY (...) constraint; other table
+    // constraints are not supported.
+    static std::vector<std::string> table_primary_key_columns(
+        const PgQuery__Constraint *constraint,
+        const std::vector<std::string> &already) {
+        if (constraint->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) {
+            throw std::runtime_error("table constraints other than PRIMARY KEY are not supported");
+        }
+        if (!already.empty()) throw std::runtime_error("multiple primary keys for table");
+        std::vector<std::string> columns;
+        for (std::size_t i = 0; i < constraint->n_keys; ++i) {
+            columns.push_back(node_string_value(constraint->keys[i]));
+        }
+        if (columns.empty()) throw std::runtime_error("PRIMARY KEY requires columns");
+        return columns;
+    }
+
+    // Live rows must satisfy the table's NOT NULL columns. Deletion markers are
+    // exempt: they carry only key values.
+    void require_not_null(
+        const std::string &logical_table,
+        const std::vector<std::string> &columns,
+        const NativeRows &rows) {
+        const NativeTableMeta meta = table_meta_for(logical_table);
+        std::vector<std::pair<std::size_t, std::string>> required;
+        for (std::size_t i = 0; i < meta.columns.size() && i < meta.column_defs.size(); ++i) {
+            if (!column_def_not_null(meta.column_defs[i])) continue;
+            const auto found = std::find(columns.begin(), columns.end(), meta.columns[i]);
+            if (found != columns.end()) {
+                required.emplace_back(static_cast<std::size_t>(found - columns.begin()), meta.columns[i]);
+            }
+        }
+        for (const auto &row : rows) {
+            for (const auto &[index, column] : required) {
+                if (index >= row.size() || std::holds_alternative<std::monostate>(row[index])) {
+                    throw std::runtime_error(
+                        "null value in column \"" + column + "\" of relation \"" + logical_table +
+                        "\" violates not-null constraint");
+                }
+            }
+        }
+    }
+
     void column_def_parts(
         PgQuery__ColumnDef *column_def,
         bool allow_primary_key,
@@ -1376,6 +1435,7 @@ class NativeBranchSessionImpl {
         }
         std::string default_sql;
         bool primary_key = false;
+        bool not_null = false;
         for (std::size_t i = 0; i < column_def->n_constraints; ++i) {
             PgQuery__Node *node = column_def->constraints[i];
             if (!node || node->node_case != PG_QUERY__NODE__NODE_CONSTRAINT || !node->constraint) {
@@ -1390,10 +1450,23 @@ class NativeBranchSessionImpl {
                 default_sql = expression_sql(constraint->raw_expr);
                 continue;
             }
-            throw std::runtime_error("column constraints other than inline primary key and constant DEFAULT are not supported");
+            if (constraint->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NOTNULL) {
+                not_null = true;
+                continue;
+            }
+            if (constraint->contype == PG_QUERY__CONSTR_TYPE__CONSTR_NULL) continue;
+            throw std::runtime_error(
+                "column constraints other than PRIMARY KEY, NOT NULL, NULL, and constant DEFAULT are not supported");
+        }
+        if (not_null && !allow_primary_key && default_sql.empty()) {
+            throw std::runtime_error("ADD COLUMN ... NOT NULL requires a DEFAULT");
         }
         const std::string column = column_def->colname;
+        // NOT NULL is kept in Chronos's column definition, before DEFAULT, and
+        // enforced on live rows by the executor; physical interval tables omit
+        // it because deletion markers carry only key values.
         std::string definition = quote_ident(column) + " " + type_name_sql(column_def->type_name);
+        if (not_null) definition += " NOT NULL";
         if (!default_sql.empty()) definition += " DEFAULT " + default_sql;
         columns.push_back(column);
         defs.push_back(definition);

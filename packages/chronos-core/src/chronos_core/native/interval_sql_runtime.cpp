@@ -4259,6 +4259,41 @@ bool eval_ast_predicate(
     throw std::runtime_error("unsupported boolean expression");
 }
 
+// Applies an SQL cast (expr::type or CAST(expr AS type)) to a value the
+// executor evaluates. Integer, floating-point, boolean, and text-like targets
+// convert; other targets keep the value for the store to coerce on write.
+Value cast_value(const Value &value, const PgQuery__TypeName *type_name) {
+    if (std::holds_alternative<std::monostate>(value) || !type_name || type_name->n_names == 0) return value;
+    std::string type = node_string_list(type_name->n_names, type_name->names).back();
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (type == "int2" || type == "int4" || type == "int8" || type == "integer" ||
+        type == "bigint" || type == "smallint") {
+        if (const auto *integer = std::get_if<std::int64_t>(&value)) return *integer;
+        if (const auto *number = std::get_if<double>(&value)) return static_cast<std::int64_t>(*number);
+        return static_cast<std::int64_t>(std::stoll(native_as_string(value)));
+    }
+    if (type == "float4" || type == "float8" || type == "real" || type == "double precision") {
+        return value_as_double(value);
+    }
+    if (type == "bool" || type == "boolean") {
+        if (std::holds_alternative<std::int64_t>(value)) return value;
+        std::string text = native_as_string(value);
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (text == "t" || text == "true" || text == "1" || text == "yes" || text == "on") return std::int64_t{1};
+        if (text == "f" || text == "false" || text == "0" || text == "no" || text == "off") return std::int64_t{0};
+        throw std::runtime_error("invalid input syntax for type boolean: " + text);
+    }
+    if (type == "text" || type == "varchar" || type == "bpchar" || type == "json" || type == "jsonb") {
+        if (std::holds_alternative<std::string>(value)) return value;
+        return native_as_string(value);
+    }
+    return value;
+}
+
 Value eval_ast_value(
     const PgQuery__Node *node,
     const std::unordered_map<std::string, Value> &row,
@@ -4266,6 +4301,11 @@ Value eval_ast_value(
     const SubqueryEvaluator *subquery_evaluator
 ) {
     if (!node) return std::monostate{};
+    if (node->node_case == PG_QUERY__NODE__NODE_TYPE_CAST && node->type_cast) {
+        return cast_value(
+            eval_ast_value(node->type_cast->arg, row, params, subquery_evaluator),
+            node->type_cast->type_name);
+    }
     switch (node->node_case) {
     case PG_QUERY__NODE__NODE_PARAM_REF: {
         int index = node->param_ref->number - 1;
@@ -4517,6 +4557,24 @@ std::optional<NativeKeyPrefixFilter> exact_leading_key_prefix_from_predicate(
         return std::nullopt;
     }
     return prefix;
+}
+
+// Whether a Chronos column definition ("name" TYPE [NOT NULL] [DEFAULT ...])
+// declares NOT NULL.
+bool column_def_not_null(const std::string &definition) {
+    const std::string upper = upper_copy(definition);
+    const std::size_t default_pos = upper.find(" DEFAULT ");
+    return upper.substr(0, default_pos).find(" NOT NULL") != std::string::npos;
+}
+
+// The column definition for a physical interval table: NOT NULL is enforced
+// by the executor on live rows, not by the physical table.
+std::string physical_column_def(const std::string &definition) {
+    const std::string upper = upper_copy(definition);
+    const std::size_t default_pos = upper.find(" DEFAULT ");
+    const std::size_t pos = upper.substr(0, default_pos).find(" NOT NULL");
+    if (pos == std::string::npos) return definition;
+    return definition.substr(0, pos) + definition.substr(pos + 9);
 }
 
 std::unordered_map<std::string, Value> column_default_values(const NativeTableMeta &meta) {

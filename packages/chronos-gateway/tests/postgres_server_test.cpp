@@ -451,6 +451,51 @@ int main() {
         check(std::string(PQgetvalue(executed.get(), 0, 0)) == "t", "prepared booleans must travel as t/f");
     }
 
+    // Common CREATE TABLE forms: NOT NULL, COLLATE, a table-level PRIMARY KEY
+    // (also composite), and casts in INSERT values.
+    expect_command(connection.get(),
+        "CREATE TABLE notes (\"objectId\" TEXT COLLATE \"C\" NOT NULL, name TEXT COLLATE \"C\", "
+        "spec JSONB, hits BIGINT, PRIMARY KEY (\"objectId\"))",
+        "CREATE 0", "CREATE TABLE with NOT NULL and a table-level PRIMARY KEY must work");
+    expect_command(connection.get(),
+        "CREATE TABLE notes__name (key TEXT NOT NULL, token TEXT NOT NULL, PRIMARY KEY (key, token))",
+        "CREATE 0", "a composite table-level PRIMARY KEY must work");
+    {
+        const char *values[] = {"n1", "first", "{\"k\": 1}", "5"};
+        Result inserted(PQexecParams(
+            connection.get(),
+            "INSERT INTO notes (\"objectId\", name, spec, hits) VALUES ($1, $2, $3::jsonb, $4::bigint)",
+            4, nullptr, values, nullptr, nullptr, 0));
+        check(PQresultStatus(inserted.get()) == PGRES_COMMAND_OK,
+              std::string("casts in INSERT values must work: ") + PQresultErrorMessage(inserted.get()));
+    }
+    expect_cell(connection.get(), "SELECT hits FROM notes WHERE \"objectId\" = 'n1'",
+                0, 0, "5", "cast values must be stored");
+    expect_command(connection.get(),
+        "INSERT INTO notes__name (key, token) VALUES ('n1', 'first'), ('n1', 'note')",
+        "INSERT 0 2", "composite-key rows must insert");
+    for (const auto *violation : {
+             "INSERT INTO notes (\"objectId\", name) VALUES (NULL, 'x')",
+             "INSERT INTO notes__name (key, token) VALUES ('n2', NULL)",
+             "UPDATE notes__name SET token = NULL WHERE key = 'n1'",
+             "INSERT INTO notes__name (key) VALUES ('n3')"}) {
+        expect_result(connection.get(), violation, PGRES_FATAL_ERROR,
+                      std::string("NOT NULL must be enforced: ") + violation);
+    }
+    expect_command(connection.get(), "DELETE FROM notes__name WHERE key = 'n1'",
+                   "DELETE 2", "deleting rows of a NOT NULL table must work");
+    expect_cell(connection.get(), "SELECT COUNT(*) FROM notes__name",
+                0, 0, "0", "deleted NOT NULL rows must be gone");
+    expect_result(connection.get(), "ALTER TABLE notes ADD COLUMN label TEXT NOT NULL",
+                  PGRES_FATAL_ERROR, "ADD COLUMN NOT NULL without a DEFAULT must fail clearly");
+    expect_command(connection.get(), "ALTER TABLE notes ADD COLUMN label TEXT NOT NULL DEFAULT 'none'",
+                   "ALTER 0", "ADD COLUMN NOT NULL with a DEFAULT must work");
+    expect_cell(connection.get(), "SELECT label FROM notes WHERE \"objectId\" = 'n1'",
+                0, 0, "none", "the new NOT NULL column must take its default");
+    expect_result(connection.get(),
+        "CREATE TABLE uniques (id INTEGER PRIMARY KEY, name TEXT, UNIQUE (name))",
+        PGRES_FATAL_ERROR, "unsupported table constraints must fail clearly");
+
     // A simple-query error must not poison an autocommit connection.
     auto syntax_error = execute(connection.get(), "SELECT * FROM missing_table");
     check(PQresultStatus(syntax_error.get()) == PGRES_FATAL_ERROR,

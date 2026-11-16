@@ -61,6 +61,15 @@ test. Set both `CHRONOS_GATEWAY_TEST_POSTGRES_DATA_URL` and
 `CHRONOS_GATEWAY_TEST_POSTGRES_METADATA_URL` to empty PostgreSQL databases to
 run the same matrix against PostgreSQL. CI runs both modes.
 
+Branch-local `CREATE TABLE` accepts a primary key either inline or as a
+table-level `PRIMARY KEY (...)`, including composite keys, plus `NOT NULL`,
+`NULL`, constant `DEFAULT`, and `COLLATE`. Every table needs a primary key, and
+other table constraints are refused. Chronos enforces `NOT NULL` on every live
+row it writes. `ALTER TABLE ... ADD COLUMN ... NOT NULL` needs a `DEFAULT`.
+`INSERT ... VALUES` accepts casts such as `$1::jsonb`, and
+`INSERT ... ON CONFLICT (primary key) DO UPDATE SET ...` updates existing rows
+with PostgreSQL's meaning of `EXCLUDED`.
+
 Result columns carry PostgreSQL type OIDs, so clients parse booleans, integers,
 floats, numeric, JSON/JSONB, timestamps, and bytea natively, and booleans
 travel as `t`/`f`. With PostgreSQL stores the types are the server's own. With
