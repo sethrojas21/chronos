@@ -36,14 +36,35 @@ struct WorkspaceConfig {
 struct CreateBranchRequest {
     std::string workspace;
     std::string from_branch;
+    // Creates the branch from a checkpoint instead of from_branch (long-lived only).
+    std::optional<std::string> from_checkpoint;
     std::string branch_id;
     std::unordered_set<std::string> postgres_stores;
     FilesystemAccess filesystem_access = FilesystemAccess::None;
-    std::chrono::seconds ttl{3600};
+    // Sandboxes always expire. A long-lived branch's access never expires when
+    // ttl is empty; the branch itself is never reclaimed.
+    std::optional<std::chrono::seconds> ttl{std::chrono::seconds(3600)};
+    // A sandbox is a terminal branch owned by its access grant and deleted when
+    // the grant is reclaimed. Otherwise the branch is long-lived: it can be
+    // branched from and merged, and its access can be reissued.
+    bool sandbox = true;
+    std::string metadata_json = "{}";
+};
+
+// Access to an existing long-lived branch, replacing any previous access.
+struct BranchAccessRequest {
+    std::string workspace;
+    std::string branch_id;
+    std::unordered_set<std::string> postgres_stores;
+    FilesystemAccess filesystem_access = FilesystemAccess::None;
+    std::optional<std::chrono::seconds> ttl;
 };
 
 struct ProvisionedBranch {
-    AccessGrant access_grant;
+    std::string workspace;
+    std::string branch_id;
+    // Empty for a long-lived branch created without data access.
+    std::optional<AccessGrant> access_grant;
     std::string database_credential;
 };
 
@@ -78,6 +99,15 @@ class GatewayRuntime {
 
     void add_workspace(const std::string &name, const WorkspaceConfig &config);
     ProvisionedBranch create_branch(const CreateBranchRequest &request);
+    ProvisionedBranch issue_branch_access(const BranchAccessRequest &request);
+    chronos::native::NativeBranchInfo branch_info(
+        const std::string &workspace,
+        const std::string &branch_id);
+    // Deletes a long-lived (or grantless) branch now and retires its access.
+    void delete_long_lived_branch(
+        const std::string &workspace,
+        const std::string &branch_id);
+    static bool is_sandbox_metadata(const std::string &metadata_json);
     AccessGrant attach_branch(
         const std::string &workspace,
         const std::string &branch_id,
@@ -116,6 +146,8 @@ class GatewayRuntime {
     static void validate_workspace(const std::string &name, const WorkspaceConfig &config);
     std::shared_ptr<Workspace> workspace(const std::string &name) const;
     void delete_branch(const AccessGrant &grant);
+    void delete_branch(Workspace &target, const std::string &branch_id);
+    ProvisionedBranch grant_access(const AccessGrantSpec &spec, bool reissue);
 
     AccessGrantRegistry access_grants_;
     mutable std::mutex workspaces_mutex_;

@@ -32,7 +32,12 @@ struct AccessGrantSpec {
     std::string branch;
     std::unordered_set<std::string> postgres_stores;
     FilesystemAccess filesystem_access = FilesystemAccess::None;
-    std::chrono::seconds ttl{3600};
+    // No ttl means the grant never expires; only grants that do not own their
+    // branch may omit it, so sandbox branches are always reclaimed.
+    std::optional<std::chrono::seconds> ttl{std::chrono::seconds(3600)};
+    // A sandbox grant owns its branch: reclaiming the grant deletes the branch.
+    // A grant on a long-lived branch only carries access to it.
+    bool owns_branch = true;
 };
 
 struct AccessGrant {
@@ -47,8 +52,12 @@ struct AccessGrant {
     std::string export_id;
     std::uint64_t generation = 1;
     std::chrono::system_clock::time_point created_at;
+    // time_point::max() when the grant never expires.
     std::chrono::system_clock::time_point expires_at;
     std::optional<std::chrono::system_clock::time_point> reclaim_at;
+    bool owns_branch = true;
+
+    bool expires() const { return expires_at != std::chrono::system_clock::time_point::max(); }
 };
 
 struct IssuedAccessGrant {
@@ -70,12 +79,15 @@ class AccessGrantRegistry {
         Clock clock = [] { return std::chrono::system_clock::now(); });
 
     IssuedAccessGrant create(const AccessGrantSpec &spec);
+    // Issues a new grant for a branch whose current grant (if any) does not own
+    // the branch, retiring the previous grant and its credential at once.
+    IssuedAccessGrant reissue(const AccessGrantSpec &spec);
     AccessGrant activate(const std::string &grant_id);
     AccessGrant attach_sandbox(
         const std::string &grant_id,
         const std::string &sandbox_id,
         const std::string &sandbox_ip);
-    AccessGrant renew(const std::string &grant_id, std::chrono::seconds ttl);
+    AccessGrant renew(const std::string &grant_id, std::optional<std::chrono::seconds> ttl);
     AccessGrant revoke(const std::string &grant_id);
     AccessGrant mark_deleted(const std::string &grant_id);
     std::optional<AccessGrant> get(const std::string &grant_id) const;
@@ -108,6 +120,11 @@ class AccessGrantRegistry {
     };
 
     static void validate_spec(const AccessGrantSpec &spec);
+    static std::chrono::system_clock::time_point expiry(
+        std::chrono::system_clock::time_point now,
+        const std::optional<std::chrono::seconds> &ttl);
+    IssuedAccessGrant insert_locked(const AccessGrantSpec &spec, std::chrono::system_clock::time_point now);
+    void forget_locked(const std::string &grant_id);
     static std::string random_token(std::size_t bytes);
     static std::string digest_secret(const std::string &secret);
     static bool constant_time_equal(const std::string &left, const std::string &right);

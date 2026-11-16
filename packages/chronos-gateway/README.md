@@ -10,6 +10,36 @@ The API follows the existing workspace lifecycle. For example,
 `POST /v1/workspaces/training/branches` corresponds to
 `workspace.create_branch(...)`; SQL and NFS both check out the returned branch.
 
+## Sandbox and long-lived branches
+
+By default a created branch is a sandbox: a terminal branch owned by its
+access grant. Its `ttl_seconds` (default 3600) bounds the access; when the
+grant is closed or expires, the reaper deletes the branch after the recovery
+window. `PATCH .../branches/{id}` with `ttl_seconds` renews the access.
+
+Pass `"sandbox": false` for a long-lived branch, for example one per agent:
+
+```json
+POST /v1/workspaces/training/branches
+{"branch_id": "agent-7", "sandbox": false, "databases": ["orders"],
+ "metadata": {"agent": "7"}}
+```
+
+- It is an ordinary branch that can be branched from and merged.
+- `ttl_seconds` is optional and limits only its access. Omitted or `null`
+  means the access never expires. Expired access never deletes the branch.
+- `metadata` (a JSON object) is stored on the branch. `from_checkpoint`
+  creates the branch from a checkpoint instead of `from_branch`.
+- Without `databases` or `filesystem`, the branch is created with no access.
+- `POST .../branches/{id}/credentials` with `databases`, `filesystem`, and an
+  optional `ttl_seconds` issues new database URLs for an existing long-lived
+  branch and retires the previous ones. Use it after a gateway restart, since
+  access grants are held in memory. Sandboxes receive credentials only when
+  created.
+- `GET .../branches/{id}` returns the branch with its metadata and current
+  access, and never returns credentials. `DELETE` deletes a long-lived branch
+  immediately, while for a sandbox it closes access as before.
+
 The executable contains the control server, PostgreSQL wire frontend,
 ChronosFS capability view, and NFS-Ganesha server in one process. Ganesha is
 loaded as a library and reads the in-process ChronosFS FUSE mount through its

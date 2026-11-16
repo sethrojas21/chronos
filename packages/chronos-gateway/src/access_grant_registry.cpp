@@ -37,6 +37,32 @@ AccessGrantRegistry::AccessGrantRegistry(std::chrono::seconds recovery_window, C
 IssuedAccessGrant AccessGrantRegistry::create(const AccessGrantSpec &spec) {
     validate_spec(spec);
     const auto now = clock_();
+    std::unique_lock lock(mutex_);
+    if (branch_to_grant_.find(branch_key(spec.workspace, spec.branch)) != branch_to_grant_.end()) {
+        throw GatewayError("workspace branch already has active sandbox access");
+    }
+    return insert_locked(spec, now);
+}
+
+IssuedAccessGrant AccessGrantRegistry::reissue(const AccessGrantSpec &spec) {
+    validate_spec(spec);
+    if (spec.owns_branch) throw GatewayError("sandbox branch access is issued only when the branch is created");
+    const auto now = clock_();
+    std::unique_lock lock(mutex_);
+    const auto existing = branch_to_grant_.find(branch_key(spec.workspace, spec.branch));
+    if (existing != branch_to_grant_.end()) {
+        const auto previous = existing->second;
+        if (required_locked(previous).record.owns_branch) {
+            throw GatewayError("sandbox branch access is issued only when the branch is created");
+        }
+        forget_locked(previous);
+    }
+    return insert_locked(spec, now);
+}
+
+IssuedAccessGrant AccessGrantRegistry::insert_locked(
+    const AccessGrantSpec &spec,
+    std::chrono::system_clock::time_point now) {
     const std::string id = random_token(16);
     const std::string credential = random_token(32);
     AccessGrant record;
@@ -45,20 +71,31 @@ IssuedAccessGrant AccessGrantRegistry::create(const AccessGrantSpec &spec) {
     record.branch = spec.branch;
     record.postgres_stores = spec.postgres_stores;
     record.filesystem_access = spec.filesystem_access;
+    record.owns_branch = spec.owns_branch;
     record.created_at = now;
-    record.expires_at = now + spec.ttl;
+    record.expires_at = expiry(now, spec.ttl);
 
-    std::unique_lock lock(mutex_);
     auto [position, inserted] = grants_.emplace(
         id,
         StoredAccessGrant{record, digest_secret(credential)});
     if (!inserted) throw GatewayError("secure grant identifier collision");
-    const auto key = branch_key(spec.workspace, spec.branch);
-    if (!branch_to_grant_.emplace(key, id).second) {
-        grants_.erase(position);
-        throw GatewayError("workspace branch already has active sandbox access");
-    }
+    branch_to_grant_.emplace(branch_key(spec.workspace, spec.branch), id);
     return IssuedAccessGrant{position->second.record, credential};
+}
+
+void AccessGrantRegistry::forget_locked(const std::string &grant_id) {
+    auto found = grants_.find(grant_id);
+    if (found == grants_.end()) return;
+    const auto &record = found->second.record;
+    if (!record.export_id.empty()) export_to_grant_.erase(record.export_id);
+    branch_to_grant_.erase(branch_key(record.workspace, record.branch));
+    grants_.erase(found);
+}
+
+std::chrono::system_clock::time_point AccessGrantRegistry::expiry(
+    std::chrono::system_clock::time_point now,
+    const std::optional<std::chrono::seconds> &ttl) {
+    return ttl ? now + *ttl : std::chrono::system_clock::time_point::max();
 }
 
 AccessGrant AccessGrantRegistry::activate(const std::string &grant_id) {
@@ -101,12 +138,15 @@ AccessGrant AccessGrantRegistry::attach_sandbox(
     return grant.record;
 }
 
-AccessGrant AccessGrantRegistry::renew(const std::string &grant_id, std::chrono::seconds ttl) {
-    if (ttl <= std::chrono::seconds::zero()) throw GatewayError("grant ttl must be positive");
+AccessGrant AccessGrantRegistry::renew(
+    const std::string &grant_id,
+    std::optional<std::chrono::seconds> ttl) {
+    if (ttl && *ttl <= std::chrono::seconds::zero()) throw GatewayError("grant ttl must be positive");
     std::unique_lock lock(mutex_);
     auto &grant = required_locked(grant_id);
     require_active_locked(grant, clock_());
-    grant.record.expires_at = clock_() + ttl;
+    if (!ttl && grant.record.owns_branch) throw GatewayError("sandbox grants require a ttl");
+    grant.record.expires_at = expiry(clock_(), ttl);
     return grant.record;
 }
 
@@ -232,7 +272,8 @@ std::vector<AccessGrant> AccessGrantRegistry::due_for_reclamation() const {
 void AccessGrantRegistry::validate_spec(const AccessGrantSpec &spec) {
     if (spec.workspace.empty()) throw GatewayError("workspace is required");
     if (spec.branch.empty()) throw GatewayError("branch is required");
-    if (spec.ttl <= std::chrono::seconds::zero()) throw GatewayError("grant ttl must be positive");
+    if (spec.ttl && *spec.ttl <= std::chrono::seconds::zero()) throw GatewayError("grant ttl must be positive");
+    if (!spec.ttl && spec.owns_branch) throw GatewayError("sandbox grants require a ttl");
     if (spec.postgres_stores.empty() && spec.filesystem_access == FilesystemAccess::None) {
         throw GatewayError("grant must grant at least one data capability");
     }

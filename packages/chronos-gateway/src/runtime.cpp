@@ -1,5 +1,7 @@
 #include "chronos/gateway/runtime.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <utility>
 
@@ -59,44 +61,140 @@ void GatewayRuntime::add_workspace(const std::string &name, const WorkspaceConfi
     }
 }
 
-ProvisionedBranch GatewayRuntime::create_branch(const CreateBranchRequest &request) {
-    if (request.from_branch.empty()) throw GatewayError("source branch is required");
-    if (request.branch_id.empty()) throw GatewayError("branch id is required");
-    auto target = workspace(request.workspace);
-    for (const auto &store : request.postgres_stores) {
-        if (target->config.postgres_stores.find(store) == target->config.postgres_stores.end()) {
+namespace {
+
+constexpr const char *kSandboxOwner = "chronos-gateway";
+
+void require_known_stores(
+    const WorkspaceConfig &config,
+    const std::unordered_set<std::string> &stores,
+    FilesystemAccess filesystem_access,
+    bool has_filesystem) {
+    for (const auto &store : stores) {
+        if (config.postgres_stores.find(store) == config.postgres_stores.end()) {
             throw GatewayError("branch requests an unknown database");
         }
     }
-    if (request.filesystem_access != FilesystemAccess::None && !target->filesystem) {
+    if (filesystem_access != FilesystemAccess::None && !has_filesystem) {
         throw GatewayError("workspace has no filesystem");
     }
+}
 
+std::string sandbox_metadata(const std::string &metadata_json) {
+    auto metadata = nlohmann::json::parse(metadata_json.empty() ? "{}" : metadata_json);
+    if (!metadata.is_object()) throw GatewayError("branch metadata must be a JSON object");
+    metadata["owner"] = kSandboxOwner;
+    return metadata.dump();
+}
+
+} // namespace
+
+bool GatewayRuntime::is_sandbox_metadata(const std::string &metadata_json) {
+    try {
+        const auto metadata = nlohmann::json::parse(metadata_json.empty() ? "{}" : metadata_json);
+        return metadata.is_object() && metadata.value("owner", std::string()) == kSandboxOwner;
+    } catch (const nlohmann::json::exception &) {
+        return false;
+    }
+}
+
+ProvisionedBranch GatewayRuntime::create_branch(const CreateBranchRequest &request) {
+    if (request.from_branch.empty() && !request.from_checkpoint) throw GatewayError("source branch is required");
+    if (request.branch_id.empty()) throw GatewayError("branch id is required");
+    if (request.sandbox && !request.ttl) throw GatewayError("sandbox branches require a ttl");
+    if (request.sandbox && request.from_checkpoint) {
+        throw GatewayError("sandbox branches are created from a branch");
+    }
+    auto target = workspace(request.workspace);
+    require_known_stores(
+        target->config, request.postgres_stores, request.filesystem_access,
+        static_cast<bool>(target->filesystem));
     {
         std::lock_guard lock(target->control_mutex);
-        target->control_store->create_branch(
-            request.branch_id,
-            request.from_branch,
-            true,
-            "{\"owner\":\"chronos-gateway\"}");
+        if (request.from_checkpoint) {
+            target->control_store->create_branch_from_checkpoint(
+                request.branch_id, *request.from_checkpoint);
+            const auto metadata = nlohmann::json::parse(request.metadata_json);
+            if (!metadata.is_object()) throw GatewayError("branch metadata must be a JSON object");
+            if (!metadata.empty()) {
+                target->control_store->update_branch_metadata(request.branch_id, request.metadata_json);
+            }
+        } else {
+            target->control_store->create_branch(
+                request.branch_id,
+                request.from_branch,
+                request.sandbox,
+                request.sandbox ? sandbox_metadata(request.metadata_json) : request.metadata_json);
+        }
         if (target->filesystem) target->filesystem->refresh(request.branch_id);
     }
-
+    const bool wants_access =
+        !request.postgres_stores.empty() || request.filesystem_access != FilesystemAccess::None;
+    if (!request.sandbox && !wants_access) {
+        return ProvisionedBranch{request.workspace, request.branch_id, std::nullopt, {}};
+    }
     AccessGrantSpec spec;
     spec.workspace = request.workspace;
     spec.branch = request.branch_id;
     spec.postgres_stores = request.postgres_stores;
     spec.filesystem_access = request.filesystem_access;
     spec.ttl = request.ttl;
+    spec.owns_branch = request.sandbox;
     try {
-        auto issued = access_grants_.create(spec);
-        issued.grant = access_grants_.activate(issued.grant.id);
-        return ProvisionedBranch{std::move(issued.grant), std::move(issued.credential)};
+        return grant_access(spec, false);
     } catch (...) {
-        std::lock_guard lock(target->control_mutex);
-        target->control_store->delete_branch(request.branch_id);
+        delete_branch(*target, request.branch_id);
         throw;
     }
+}
+
+ProvisionedBranch GatewayRuntime::issue_branch_access(const BranchAccessRequest &request) {
+    auto target = workspace(request.workspace);
+    require_known_stores(
+        target->config, request.postgres_stores, request.filesystem_access,
+        static_cast<bool>(target->filesystem));
+    {
+        std::lock_guard lock(target->control_mutex);
+        const auto info = target->control_store->get_branch(request.branch_id);
+        if (is_sandbox_metadata(info.metadata_json)) {
+            throw GatewayError("sandbox branch access is issued only when the branch is created");
+        }
+    }
+    AccessGrantSpec spec;
+    spec.workspace = request.workspace;
+    spec.branch = request.branch_id;
+    spec.postgres_stores = request.postgres_stores;
+    spec.filesystem_access = request.filesystem_access;
+    spec.ttl = request.ttl;
+    spec.owns_branch = false;
+    return grant_access(spec, true);
+}
+
+ProvisionedBranch GatewayRuntime::grant_access(const AccessGrantSpec &spec, bool reissue) {
+    auto issued = reissue ? access_grants_.reissue(spec) : access_grants_.create(spec);
+    issued.grant = access_grants_.activate(issued.grant.id);
+    return ProvisionedBranch{
+        spec.workspace, spec.branch, std::move(issued.grant), std::move(issued.credential)};
+}
+
+chronos::native::NativeBranchInfo GatewayRuntime::branch_info(
+    const std::string &workspace_name,
+    const std::string &branch_id) {
+    auto target = workspace(workspace_name);
+    std::lock_guard lock(target->control_mutex);
+    return target->control_store->get_branch(branch_id);
+}
+
+void GatewayRuntime::delete_long_lived_branch(
+    const std::string &workspace_name,
+    const std::string &branch_id) {
+    auto target = workspace(workspace_name);
+    if (auto grant = access_grants_.get_for_branch(workspace_name, branch_id)) {
+        if (grant->owns_branch) throw GatewayError("sandbox branches are closed, then reclaimed");
+        access_grants_.revoke(grant->id);
+        access_grants_.mark_deleted(grant->id);
+    }
+    delete_branch(*target, branch_id);
 }
 
 AccessGrant GatewayRuntime::attach_branch(
@@ -169,7 +267,8 @@ std::vector<AccessGrant> GatewayRuntime::reclaim_due() {
     reclaimed.reserve(due.size());
     for (const auto &grant : due) {
         try {
-            delete_branch(grant);
+            // Only a sandbox grant owns its branch; other grants only carry access.
+            if (grant.owns_branch) delete_branch(grant);
             reclaimed.push_back(access_grants_.mark_deleted(grant.id));
         } catch (...) {
             // Leave the grant revoked so the next reaper pass retries safely.
@@ -218,10 +317,13 @@ std::shared_ptr<GatewayRuntime::Workspace> GatewayRuntime::workspace(
 }
 
 void GatewayRuntime::delete_branch(const AccessGrant &grant) {
-    auto target = workspace(grant.workspace);
-    std::lock_guard lock(target->control_mutex);
-    if (target->filesystem) target->filesystem->refresh(grant.branch);
-    target->control_store->delete_branch(grant.branch);
+    delete_branch(*workspace(grant.workspace), grant.branch);
+}
+
+void GatewayRuntime::delete_branch(Workspace &target, const std::string &branch_id) {
+    std::lock_guard lock(target.control_mutex);
+    if (target.filesystem) target.filesystem->refresh(branch_id);
+    target.control_store->delete_branch(branch_id);
 }
 
 } // namespace chronos::gateway

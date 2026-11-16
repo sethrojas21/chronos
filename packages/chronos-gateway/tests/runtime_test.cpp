@@ -9,6 +9,7 @@
 #include <string>
 #include <unistd.h>
 
+using chronos::gateway::BranchAccessRequest;
 using chronos::gateway::CreateBranchRequest;
 using chronos::gateway::FilesystemAccess;
 using chronos::gateway::FilesystemConfig;
@@ -115,9 +116,9 @@ int main() {
     auto issued = runtime.create_branch(request);
 
     rejects(
-        [&] { runtime.open_postgres(issued.access_grant.id, issued.database_credential, "events"); },
+        [&] { runtime.open_postgres(issued.access_grant->id, issued.database_credential, "events"); },
         "grant must not open an unlisted store");
-    auto sql = runtime.open_postgres(issued.access_grant.id, issued.database_credential, "orders");
+    auto sql = runtime.open_postgres(issued.access_grant->id, issued.database_credential, "orders");
     sql->session().execute(
         "UPDATE orders SET state = ? WHERE id = ?",
         {std::string("placed"), std::int64_t(1)});
@@ -144,7 +145,7 @@ int main() {
 
     runtime.close_branch("training", "rollout-1");
     rejects(
-        [&] { runtime.open_postgres(issued.access_grant.id, issued.database_credential, "orders"); },
+        [&] { runtime.open_postgres(issued.access_grant->id, issued.database_credential, "orders"); },
         "revoked SQL grant must fail");
     rejects(
         [&] { runtime.authorize_filesystem(bound.export_id, "10.0.0.21", false); },
@@ -152,6 +153,88 @@ int main() {
     check(runtime.reclaim_due().empty(), "recovery window must delay deletion");
     now += std::chrono::minutes(10);
     check(runtime.reclaim_due().size() == 1, "reaper must delete expired branch");
+
+    // Long-lived branches: no expiry, access reissued after a restart, and the
+    // branch survives the expiry and reclamation of its access.
+    auto missing = [&](GatewayRuntime &target, const std::string &branch) {
+        try {
+            target.branch_info("training", branch);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    };
+    CreateBranchRequest lasting;
+    lasting.workspace = "training";
+    lasting.from_branch = "main";
+    lasting.branch_id = "agent-1";
+    lasting.sandbox = false;
+    lasting.ttl.reset();
+    lasting.metadata_json = R"({"agent":"a1"})";
+    lasting.postgres_stores = {"orders"};
+    auto kept = runtime.create_branch(lasting);
+    check(kept.access_grant && !kept.access_grant->expires(), "long-lived access must not expire");
+    auto info = runtime.branch_info("training", "agent-1");
+    check(info.metadata_json.find("a1") != std::string::npos, "long-lived branch must keep its metadata");
+    check(!GatewayRuntime::is_sandbox_metadata(info.metadata_json), "long-lived branch must not be a sandbox");
+    auto agent_sql = runtime.open_postgres(kept.access_grant->id, kept.database_credential, "orders");
+    agent_sql->session().execute(
+        "UPDATE orders SET state = ? WHERE id = ?", {std::string("agent"), std::int64_t(1)});
+    agent_sql.reset();
+    now += std::chrono::hours(24 * 30);
+    runtime.expire_due();
+    runtime.reclaim_due();
+    check(!missing(runtime, "agent-1"), "long-lived branch must not be reclaimed");
+
+    GatewayRuntime restarted(std::chrono::minutes(10), [&] { return now; });
+    restarted.add_workspace("training", workspace);
+    BranchAccessRequest access;
+    access.workspace = "training";
+    access.branch_id = "agent-1";
+    access.postgres_stores = {"orders"};
+    access.ttl = std::chrono::minutes(5);
+    auto again = restarted.issue_branch_access(access);
+    auto again_sql = restarted.open_postgres(again.access_grant->id, again.database_credential, "orders");
+    auto agent_rows = again_sql->session().query("SELECT state FROM orders WHERE id = ?", {std::int64_t(1)});
+    check(std::get<std::string>(agent_rows.rows.at(0).at(0)) == "agent",
+          "reissued access must reach the same branch data");
+    again_sql.reset();
+    now += std::chrono::minutes(5);
+    restarted.expire_due();
+    now += std::chrono::minutes(10);
+    restarted.reclaim_due();
+    check(!missing(restarted, "agent-1"), "expired access must leave a long-lived branch in place");
+    rejects(
+        [&] { restarted.open_postgres(again.access_grant->id, again.database_credential, "orders"); },
+        "expired long-lived access must fail");
+
+    CreateBranchRequest box = request;
+    box.branch_id = "rollout-2";
+    runtime.create_branch(box);
+    BranchAccessRequest box_access = access;
+    box_access.branch_id = "rollout-2";
+    rejects([&] { runtime.issue_branch_access(box_access); }, "sandbox access must not be reissued");
+    CreateBranchRequest endless_box = request;
+    endless_box.branch_id = "rollout-3";
+    endless_box.ttl.reset();
+    rejects([&] { runtime.create_branch(endless_box); }, "sandbox branches must require a ttl");
+
+    orders_setup.create_checkpoint("agent-saved", "agent-1");
+    CreateBranchRequest restored;
+    restored.workspace = "training";
+    restored.from_checkpoint = "agent-saved";
+    restored.branch_id = "agent-restored";
+    restored.sandbox = false;
+    restored.ttl.reset();
+    restored.metadata_json = R"({"from":"checkpoint"})";
+    auto restored_branch = runtime.create_branch(restored);
+    check(!restored_branch.access_grant, "a branch created without data access has no grant");
+    check(runtime.branch_info("training", "agent-restored").metadata_json.find("checkpoint") != std::string::npos,
+          "a branch from a checkpoint must keep its metadata");
+    runtime.delete_long_lived_branch("training", "agent-restored");
+    check(missing(runtime, "agent-restored"), "deleting a long-lived branch must remove it");
+    runtime.delete_long_lived_branch("training", "agent-1");
+    check(missing(runtime, "agent-1"), "deleting a long-lived branch with access must remove it");
 
     std::cout << "all gateway runtime integration tests passed\n";
     return 0;

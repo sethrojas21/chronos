@@ -158,6 +158,43 @@ int main() {
     check(closed.result() == http::status::ok, closed.body());
     check(Json::parse(closed.body()).at("state") == "closed", "DELETE must close immediately");
 
+    // Long-lived branch: no expiry, metadata, credentials on demand, deletion.
+    const std::string agent_path = "/v1/workspaces/training/branches/agent%2F1";
+    auto lasting = request(port, http::verb::post, "/v1/workspaces/training/branches", {
+        {"branch_id", "agent/1"},
+        {"sandbox", false},
+        {"databases", Json::array({"orders"})},
+        {"metadata", {{"agent", "a1"}}},
+    });
+    check(lasting.result() == http::status::created, lasting.body());
+    auto agent = Json::parse(lasting.body());
+    check(agent.at("sandbox") == false && agent.at("expires_at").is_null(),
+          "a long-lived branch must not be a sandbox or expire");
+    check(agent.at("database_urls").contains("orders"), "creation must return database URLs");
+    auto agent_info = Json::parse(request(port, http::verb::get, agent_path).body());
+    check(agent_info.at("metadata").at("agent") == "a1", "lookup must return branch metadata");
+    check(!agent_info.contains("database_urls"), "lookup must not reissue credentials");
+    auto reissued = request(port, http::verb::post, agent_path + "/credentials", {
+        {"databases", Json::array({"orders"})}, {"ttl_seconds", 60}});
+    check(reissued.result() == http::status::ok, reissued.body());
+    auto fresh = Json::parse(reissued.body());
+    check(fresh.at("database_urls").at("orders") != agent.at("database_urls").at("orders"),
+          "credentials must be newly issued");
+    check(!fresh.at("expires_at").is_null(), "credentials may expire");
+    auto boxed = request(port, http::verb::post, "/v1/workspaces/training/branches", {
+        {"branch_id", "rollout/two"}, {"databases", Json::array({"orders"})}});
+    check(boxed.result() == http::status::created && Json::parse(boxed.body()).at("sandbox") == true,
+          "branches stay sandboxes by default");
+    auto refused = request(port, http::verb::post,
+                           "/v1/workspaces/training/branches/rollout%2Ftwo/credentials",
+                           {{"databases", Json::array({"orders"})}});
+    check(refused.result() == http::status::bad_request, "sandbox credentials must not be reissued");
+    auto deleted = request(port, http::verb::delete_, agent_path);
+    check(deleted.result() == http::status::ok && Json::parse(deleted.body()).at("state") == "deleted",
+          "DELETE must delete a long-lived branch");
+    check(request(port, http::verb::get, agent_path).result() == http::status::not_found,
+          "a deleted long-lived branch must be gone");
+
     server.stop();
     server_thread.join();
     std::cout << "all gateway control API tests passed\n";

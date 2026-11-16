@@ -3,6 +3,8 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <nlohmann/json.hpp>
+
+#include <optional>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
@@ -52,12 +54,43 @@ Json branch_json(const AccessGrant &grant) {
     return {
         {"workspace", grant.workspace},
         {"branch_id", grant.branch},
+        {"sandbox", grant.owns_branch},
         {"databases", stores},
         {"state", state_name(grant.state)},
-        {"expires_at", unix_seconds(grant.expires_at)},
+        {"expires_at", grant.expires() ? Json(unix_seconds(grant.expires_at)) : Json(nullptr)},
         {"sandbox_id", grant.sandbox_id},
         {"sandbox_ip", grant.sandbox_ip},
     };
+}
+
+// A long-lived branch without current data access.
+Json branch_json(const std::string &workspace, const std::string &branch_id) {
+    return {{"workspace", workspace}, {"branch_id", branch_id}, {"sandbox", false}};
+}
+
+FilesystemAccess filesystem_access(const Json &body) {
+    const std::string filesystem = body.value("filesystem", std::string("none"));
+    if (filesystem == "read_only") return FilesystemAccess::ReadOnly;
+    if (filesystem == "read_write") return FilesystemAccess::ReadWrite;
+    if (filesystem != "none") throw GatewayError("filesystem must be none, read_only, or read_write");
+    return FilesystemAccess::None;
+}
+
+// ttl_seconds: absent gives fallback, null means no expiry.
+std::optional<std::chrono::seconds> ttl(
+    const Json &body,
+    std::optional<std::chrono::seconds> fallback) {
+    const auto found = body.find("ttl_seconds");
+    if (found == body.end()) return fallback;
+    if (found->is_null()) return std::nullopt;
+    return std::chrono::seconds(found->get<long long>());
+}
+
+std::string metadata_json(const Json &body) {
+    const auto found = body.find("metadata");
+    if (found == body.end() || found->is_null()) return "{}";
+    if (!found->is_object()) throw GatewayError("metadata must be a JSON object");
+    return found->dump();
 }
 
 bool secure_equal(const std::string &left, const std::string &right) {
@@ -214,6 +247,11 @@ class ControlServer::Impl {
                 request.method() == http::verb::post) {
                 return attach(parts[2], parts[4], request);
             }
+            if (parts.size() == 6 && parts[0] == "v1" && parts[1] == "workspaces" &&
+                parts[3] == "branches" && parts[5] == "credentials" &&
+                request.method() == http::verb::post) {
+                return credentials(parts[2], parts[4], request);
+            }
             return json_response(http::status::not_found, {{"error", "not found"}});
         } catch (const GatewayError &error) {
             return json_response(http::status::bad_request, {{"error", error.what()}});
@@ -228,25 +266,51 @@ class ControlServer::Impl {
         const auto body = Json::parse(request.body());
         CreateBranchRequest create;
         create.workspace = workspace_name;
+        create.sandbox = body.value("sandbox", true);
         create.from_branch = body.value("from_branch", std::string("main"));
+        if (body.contains("from_checkpoint") && !body.at("from_checkpoint").is_null()) {
+            create.from_checkpoint = body.at("from_checkpoint").get<std::string>();
+        }
         create.branch_id = body.value("branch_id", random_branch_id());
         create.postgres_stores = body.value(
             "databases", std::unordered_set<std::string>{});
-        const std::string filesystem = body.value("filesystem", std::string("none"));
-        if (filesystem == "read_only") create.filesystem_access = FilesystemAccess::ReadOnly;
-        else if (filesystem == "read_write") create.filesystem_access = FilesystemAccess::ReadWrite;
-        else if (filesystem != "none") throw GatewayError("filesystem must be none, read_only, or read_write");
-        create.ttl = std::chrono::seconds(body.value("ttl_seconds", 3600LL));
-        auto branch = runtime.create_branch(create);
-        auto result = branch_json(branch.access_grant);
+        create.filesystem_access = filesystem_access(body);
+        create.ttl = ttl(body, create.sandbox
+            ? std::optional<std::chrono::seconds>(std::chrono::seconds(3600))
+            : std::nullopt);
+        create.metadata_json = metadata_json(body);
+        return json_response(http::status::created, provisioned_json(runtime.create_branch(create)));
+    }
+
+    http::response<http::string_body> credentials(
+        const std::string &workspace_name,
+        const std::string &branch_id,
+        const http::request<http::string_body> &request) {
+        const auto body = Json::parse(request.body());
+        BranchAccessRequest access;
+        access.workspace = workspace_name;
+        access.branch_id = branch_id;
+        access.postgres_stores = body.value(
+            "databases", std::unordered_set<std::string>{});
+        access.filesystem_access = filesystem_access(body);
+        access.ttl = ttl(body, std::nullopt);
+        return json_response(http::status::ok, provisioned_json(runtime.issue_branch_access(access)));
+    }
+
+    // The only responses that carry database credentials: branch creation and
+    // explicit credential issue.
+    Json provisioned_json(const ProvisionedBranch &branch) const {
+        if (!branch.access_grant) return branch_json(branch.workspace, branch.branch_id);
+        const auto &grant = *branch.access_grant;
+        auto result = branch_json(grant);
         Json urls = Json::object();
-        for (const auto &store : branch.access_grant.postgres_stores) {
-            urls[store] = "postgresql://" + branch.access_grant.id + ":" +
+        for (const auto &store : grant.postgres_stores) {
+            urls[store] = "postgresql://" + grant.id + ":" +
                 branch.database_credential + "@" +
                 postgres.endpoint() + "/" + store;
         }
         result["database_urls"] = std::move(urls);
-        return json_response(http::status::created, result);
+        return result;
     }
 
     http::response<http::string_body> attach(
@@ -271,11 +335,10 @@ class ControlServer::Impl {
         const std::string &branch_id,
         const http::request<http::string_body> &request) {
         const auto body = Json::parse(request.body());
+        if (!body.contains("ttl_seconds")) throw GatewayError("ttl_seconds is required");
         auto current = runtime.access_grants().get_for_branch(workspace_name, branch_id);
         if (!current) return json_response(http::status::not_found, {{"error", "not found"}});
-        auto grant = runtime.access_grants().renew(
-            current->id,
-            std::chrono::seconds(body.at("ttl_seconds").get<long long>()));
+        auto grant = runtime.access_grants().renew(current->id, ttl(body, std::nullopt));
         return json_response(http::status::ok, branch_json(grant));
     }
 
@@ -283,16 +346,36 @@ class ControlServer::Impl {
         const std::string &workspace_name,
         const std::string &branch_id) {
         auto grant = runtime.access_grants().get_for_branch(workspace_name, branch_id);
-        if (!grant) return json_response(http::status::not_found, {{"error", "not found"}});
-        return json_response(http::status::ok, branch_json(*grant));
+        std::optional<chronos::native::NativeBranchInfo> info;
+        try {
+            info = runtime.branch_info(workspace_name, branch_id);
+        } catch (const std::exception &) {
+            // A reclaimed sandbox keeps its grant record after its branch is gone.
+        }
+        if (!grant && !info) return json_response(http::status::not_found, {{"error", "not found"}});
+        auto result = grant ? branch_json(*grant) : branch_json(workspace_name, branch_id);
+        if (info) {
+            result["created_at"] = info->created_at;
+            result["metadata"] = Json::parse(info->metadata_json.empty() ? "{}" : info->metadata_json);
+            if (!grant) result["sandbox"] = GatewayRuntime::is_sandbox_metadata(info->metadata_json);
+        }
+        return json_response(http::status::ok, result);
     }
 
     http::response<http::string_body> close(
         const std::string &workspace_name,
         const std::string &branch_id) {
-        return json_response(
-            http::status::ok,
-            branch_json(runtime.close_branch(workspace_name, branch_id)));
+        auto grant = runtime.access_grants().get_for_branch(workspace_name, branch_id);
+        if (grant && grant->owns_branch) {
+            // Sandbox: close access now; the reaper deletes the branch later.
+            return json_response(
+                http::status::ok,
+                branch_json(runtime.close_branch(workspace_name, branch_id)));
+        }
+        runtime.delete_long_lived_branch(workspace_name, branch_id);
+        auto result = branch_json(workspace_name, branch_id);
+        result["state"] = "deleted";
+        return json_response(http::status::ok, result);
     }
 
     static http::response<http::string_body> json_response(

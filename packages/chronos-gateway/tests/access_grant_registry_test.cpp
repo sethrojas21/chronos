@@ -138,6 +138,44 @@ int main() {
         [&] { registry.authorize_filesystem(bound.export_id, "10.0.0.8", false); },
         "deleted export must not resolve");
 
+    // Long-lived access: no ttl, does not own its branch, reissued on demand.
+    AccessGrantSpec sandbox_without_ttl = full_spec();
+    sandbox_without_ttl.branch = "sandbox-no-ttl";
+    sandbox_without_ttl.ttl.reset();
+    rejects([&] { registry.create(sandbox_without_ttl); }, "sandbox grants must require a ttl");
+    AccessGrantSpec lasting = full_spec();
+    lasting.branch = "agent-main";
+    lasting.ttl.reset();
+    lasting.owns_branch = false;
+    auto first = registry.create(lasting);
+    registry.activate(first.grant.id);
+    check(!first.grant.expires() && !first.grant.owns_branch, "long-lived access must not expire or own its branch");
+    now += std::chrono::hours(24 * 365);
+    for (const auto &expired : registry.expire_due()) {
+        check(expired.id != first.grant.id, "a grant without ttl must never expire");
+    }
+    registry.authorize_postgres(first.grant.id, first.credential, "orders");
+    auto second = registry.reissue(lasting);
+    registry.activate(second.grant.id);
+    rejects([&] { registry.authorize_postgres(first.grant.id, first.credential, "orders"); },
+            "reissue must retire the previous credential");
+    registry.authorize_postgres(second.grant.id, second.credential, "orders");
+    check(registry.get_for_branch("agent-training", "agent-main")->id == second.grant.id,
+          "the branch must resolve its reissued grant");
+    auto limited = registry.renew(second.grant.id, std::chrono::minutes(5));
+    check(limited.expires(), "long-lived access may take a ttl");
+    check(!registry.renew(second.grant.id, std::nullopt).expires(), "long-lived access may drop its ttl");
+
+    AccessGrantSpec kept_sandbox = full_spec();
+    kept_sandbox.branch = "sandbox-keep";
+    auto boxed = registry.create(kept_sandbox);
+    registry.activate(boxed.grant.id);
+    rejects([&] { registry.renew(boxed.grant.id, std::nullopt); }, "sandbox grants must keep a ttl");
+    AccessGrantSpec steal = lasting;
+    steal.branch = "sandbox-keep";
+    rejects([&] { registry.reissue(steal); }, "sandbox access must not be reissued");
+    rejects([&] { registry.reissue(kept_sandbox); }, "reissue must not create sandbox access");
+
     std::cout << "all grant registry tests passed\n";
     return 0;
 }

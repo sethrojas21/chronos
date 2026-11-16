@@ -139,7 +139,7 @@ int main() {
 
     const auto options = "vers=4.2,port=" + std::to_string(port) +
         ",proto=tcp,timeo=10,retrans=1";
-    const auto remote = "127.0.0.1:/" + issued.access_grant.export_id;
+    const auto remote = "127.0.0.1:/" + issued.access_grant->export_id;
     const int mounted = command({"/usr/bin/mount", "-t", "nfs4", "-o", options,
                                  remote, client_mount});
     if (mounted != 0) {
@@ -147,7 +147,7 @@ int main() {
         thread.join();
         check(false, "NFSv4 client could not mount the grant capability");
     }
-    const auto sibling_remote = "127.0.0.1:/" + sibling.access_grant.export_id;
+    const auto sibling_remote = "127.0.0.1:/" + sibling.access_grant->export_id;
     const int sibling_mounted = command({"/usr/bin/mount", "-t", "nfs4", "-o", options,
                                          sibling_remote, sibling_mount});
     if (sibling_mounted != 0) {

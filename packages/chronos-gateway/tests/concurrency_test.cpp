@@ -61,7 +61,7 @@ std::uint16_t unused_port() {
 Connection connect(std::uint16_t port, const ProvisionedBranch &grant) {
     const std::string parameters =
         "host=127.0.0.1 port=" + std::to_string(port) +
-        " user=" + grant.access_grant.id + " password=" + grant.database_credential +
+        " user=" + grant.access_grant->id + " password=" + grant.database_credential +
         " dbname=orders sslmode=disable connect_timeout=5";
     for (int attempt = 0; attempt < 100; ++attempt) {
         Connection connection(PQconnectdb(parameters.c_str()));

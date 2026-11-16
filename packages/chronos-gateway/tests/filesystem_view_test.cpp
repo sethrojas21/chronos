@@ -80,8 +80,8 @@ int main() {
 
     auto root = view.list("/");
     check(root.size() == 2, "capability root must not enumerate export ids");
-    const auto rw = "/" + writable.access_grant.export_id;
-    const auto ro = "/" + read_only.access_grant.export_id;
+    const auto rw = "/" + writable.access_grant->export_id;
+    const auto ro = "/" + read_only.access_grant->export_id;
     check(view.stat(rw).kind == "directory", "export capability must resolve branch root");
     view.create_directory(rw + "/work", 0755);
     view.create_file(rw + "/work/result.txt", 0644, 1234, 2345);
@@ -112,7 +112,7 @@ int main() {
     rejects([&] { view.rename(rw + "/work/final.txt", ro + "/stolen"); },
             "rename must not cross capabilities");
     rejects([&] { view.stat("/unknown/file"); }, "unknown capabilities must not resolve");
-    rejects([&] { view.stat(rw + "/../" + read_only.access_grant.export_id); },
+    rejects([&] { view.stat(rw + "/../" + read_only.access_grant->export_id); },
             "path traversal must not escape a capability");
 
     runtime.close_branch("training", "rollout-view-rw");

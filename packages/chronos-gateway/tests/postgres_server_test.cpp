@@ -175,7 +175,7 @@ int main() {
     PostgresServer server(runtime, ListenAddress{"127.0.0.1", port});
     std::thread server_thread([&] { server.run(); });
 
-    auto connection = connect(port, issued.access_grant.id, issued.database_credential, "orders");
+    auto connection = connect(port, issued.access_grant->id, issued.database_credential, "orders");
     check(PQstatus(connection.get()) == CONNECTION_OK, PQerrorMessage(connection.get()));
     auto selected = execute(connection.get(), "SELECT state FROM orders WHERE id = 1");
     check(PQresultStatus(selected.get()) == PGRES_TUPLES_OK, PQerrorMessage(connection.get()));
@@ -448,7 +448,7 @@ int main() {
     expect_command(connection.get(), "DELETE FROM orders WHERE id = 6",
                    "DELETE 1", "committed test data must be removable");
 
-    auto bad = connect(port, issued.access_grant.id, "wrong", "orders");
+    auto bad = connect(port, issued.access_grant->id, "wrong", "orders");
     check(PQstatus(bad.get()) == CONNECTION_BAD, "wrong grant secret must fail authentication");
 
     runtime.close_branch("training", "rollout-wire");

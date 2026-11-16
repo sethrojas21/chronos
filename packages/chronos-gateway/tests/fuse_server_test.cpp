@@ -90,7 +90,7 @@ int main() {
         return 77;
     }
 
-    const auto export_root = mountpoint + "/" + issued.access_grant.export_id;
+    const auto export_root = mountpoint + "/" + issued.access_grant->export_id;
     check(std::filesystem::is_directory(export_root), "capability root must be mountable");
     std::size_t visible_exports = 0;
     for (const auto &ignored : std::filesystem::directory_iterator(mountpoint)) {
