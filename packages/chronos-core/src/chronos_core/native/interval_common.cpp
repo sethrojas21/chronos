@@ -39,6 +39,8 @@ struct BulkUpsertResult {
 struct QueryResult {
     std::vector<std::string> columns;
     NativeRows rows;
+    // PostgreSQL type OID per column; 0 or absent when unknown.
+    std::vector<std::uint32_t> column_types;
 };
 
 struct NativeInsertPlan {

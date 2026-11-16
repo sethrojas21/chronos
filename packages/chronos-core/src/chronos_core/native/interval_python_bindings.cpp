@@ -538,7 +538,7 @@ IntervalQueryResult NativeBranchSession::query(
     const std::vector<IntervalValue> &params
 ) {
     QueryResult result = impl_->query(sql, params);
-    return {std::move(result.columns), std::move(result.rows)};
+    return {std::move(result.columns), std::move(result.rows), std::move(result.column_types)};
 }
 
 IntervalQueryResult NativeBranchSession::explain(
@@ -546,7 +546,7 @@ IntervalQueryResult NativeBranchSession::explain(
     const std::vector<IntervalValue> &params
 ) {
     QueryResult result = impl_->explain(sql, params);
-    return {std::move(result.columns), std::move(result.rows)};
+    return {std::move(result.columns), std::move(result.rows), std::move(result.column_types)};
 }
 
 std::string NativeBranchSession::rewrite_query(const std::string &sql) {

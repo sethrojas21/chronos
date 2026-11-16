@@ -1522,6 +1522,30 @@ std::string cpp_int_to_decimal(const cpp_int &value) {
     return value.convert_to<std::string>();
 }
 
+// The PostgreSQL type OID for a SQLite declared column type, following
+// SQLite's own affinity rules; 0 when the type is unknown (e.g. expressions).
+std::uint32_t pg_type_for_declared_type(const char *declared) {
+    if (!declared || !*declared) return 0;
+    std::string type(declared);
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    auto has = [&](const char *part) { return type.find(part) != std::string::npos; };
+    if (has("BOOL")) return 16;
+    if (has("JSONB")) return 3802;
+    if (has("JSON")) return 114;
+    if (has("BYTEA") || has("BLOB")) return 17;
+    if (has("TIMESTAMPTZ") || has("WITH TIME ZONE")) return 1184;
+    if (has("TIMESTAMP")) return 1114;
+    if (type == "DATE") return 1082;
+    if (has("SMALLINT") || has("INT2")) return 21;
+    if (has("INT")) return 20;  // SQLite integers are 64-bit
+    if (has("CHAR") || has("CLOB") || has("TEXT")) return 25;
+    if (has("REAL") || has("FLOA") || has("DOUB")) return 701;
+    if (has("NUMERIC") || has("DECIMAL")) return 1700;
+    return 0;
+}
+
 Value pg_branch_value(PGresult *result, int row, int column) {
     if (PQgetisnull(result, row, column)) return std::monostate{};
     const Oid oid = PQftype(result, column);
@@ -2819,9 +2843,11 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
         QueryResult result;
         int cols = sqlite3_column_count(stmt);
         result.columns.reserve(static_cast<std::size_t>(cols));
+        result.column_types.reserve(static_cast<std::size_t>(cols));
         for (int c = 0; c < cols; ++c) {
             const char *name = sqlite3_column_name(stmt, c);
             result.columns.emplace_back(name ? name : "");
+            result.column_types.push_back(pg_type_for_declared_type(sqlite3_column_decltype(stmt, c)));
         }
         while (true) {
             int rc = sqlite3_step(stmt);
@@ -3541,8 +3567,10 @@ class NativePostgresDriver final : public NativeSqlDriver {
         int nrows = PQntuples(result);
         int ncols = PQnfields(result);
         out.columns.reserve(static_cast<std::size_t>(ncols));
+        out.column_types.reserve(static_cast<std::size_t>(ncols));
         for (int c = 0; c < ncols; ++c) {
             out.columns.emplace_back(PQfname(result, c));
+            out.column_types.push_back(static_cast<std::uint32_t>(PQftype(result, c)));
         }
         out.rows.reserve(static_cast<std::size_t>(nrows));
         for (int r = 0; r < nrows; ++r) {

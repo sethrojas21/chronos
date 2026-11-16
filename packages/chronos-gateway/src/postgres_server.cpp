@@ -182,14 +182,54 @@ std::string value_text(const IntervalValue &value) {
     return out.str();
 }
 
-void send_row_description(tcp::socket &socket, const std::vector<std::string> &columns) {
+constexpr std::uint32_t kTextOid = 25;
+constexpr std::uint32_t kBoolOid = 16;
+
+// PostgreSQL type OID for a value whose column type the store did not report.
+std::uint32_t inferred_type_oid(const IntervalValue &value) {
+    if (std::holds_alternative<std::int64_t>(value)) return 20;                       // int8
+    if (std::holds_alternative<double>(value)) return 701;                            // float8
+    if (std::holds_alternative<chronos::native::IntervalBlob>(value)) return 17;      // bytea
+    if (std::holds_alternative<chronos::native::IntervalDecimal>(value)) return 1700; // numeric
+    if (std::holds_alternative<chronos::native::IntervalDate>(value)) return 1082;    // date
+    return kTextOid;
+}
+
+// One type OID per result column: the store's type when known, otherwise the
+// type of the column's first non-null value, otherwise text.
+std::vector<std::uint32_t> result_type_oids(const IntervalQueryResult &result) {
+    std::vector<std::uint32_t> oids(result.columns.size(), 0);
+    for (std::size_t column = 0; column < oids.size(); ++column) {
+        if (column < result.column_types.size()) oids[column] = result.column_types[column];
+        if (oids[column] != 0) continue;
+        oids[column] = kTextOid;
+        for (const auto &row : result.rows) {
+            if (column < row.size() && !std::holds_alternative<std::monostate>(row[column])) {
+                oids[column] = inferred_type_oid(row[column]);
+                break;
+            }
+        }
+    }
+    return oids;
+}
+
+// Text-format value for its column type; booleans travel as t/f.
+std::string value_text(const IntervalValue &value, std::uint32_t oid) {
+    if (oid == kBoolOid) {
+        if (const auto *integer = std::get_if<std::int64_t>(&value)) return *integer ? "t" : "f";
+    }
+    return value_text(value);
+}
+
+void send_row_description(tcp::socket &socket, const IntervalQueryResult &result) {
+    const auto oids = result_type_oids(result);
     std::string payload;
-    append_u16(payload, static_cast<std::uint16_t>(columns.size()));
-    for (const auto &column : columns) {
-        append_cstring(payload, column);
+    append_u16(payload, static_cast<std::uint16_t>(result.columns.size()));
+    for (std::size_t column = 0; column < result.columns.size(); ++column) {
+        append_cstring(payload, result.columns[column]);
         append_u32(payload, 0);              // table oid
         append_u16(payload, 0);              // attribute number
-        append_u32(payload, 25);             // text oid
+        append_u32(payload, oids[column]);   // type oid
         append_u16(payload, 0xffff);         // variable length
         append_u32(payload, 0xffffffff);     // no type modifier
         append_u16(payload, 0);              // text format
@@ -197,16 +237,17 @@ void send_row_description(tcp::socket &socket, const std::vector<std::string> &c
     send_message(socket, 'T', payload);
 }
 
-void send_result(tcp::socket &socket, const IntervalQueryResult &result) {
-    send_row_description(socket, result.columns);
+void send_data_rows(tcp::socket &socket, const IntervalQueryResult &result) {
+    const auto oids = result_type_oids(result);
     for (const auto &row : result.rows) {
         std::string payload;
         append_u16(payload, static_cast<std::uint16_t>(row.size()));
-        for (const auto &value : row) {
+        for (std::size_t column = 0; column < row.size(); ++column) {
+            const auto &value = row[column];
             if (std::holds_alternative<std::monostate>(value)) {
                 append_u32(payload, 0xffffffff);
             } else {
-                const auto text = value_text(value);
+                const auto text = value_text(value, column < oids.size() ? oids[column] : kTextOid);
                 append_u32(payload, static_cast<std::uint32_t>(text.size()));
                 payload.append(text);
             }
@@ -214,6 +255,11 @@ void send_result(tcp::socket &socket, const IntervalQueryResult &result) {
         send_message(socket, 'D', payload);
     }
     send_message(socket, 'C', "SELECT " + std::to_string(result.rows.size()) + '\0');
+}
+
+void send_result(tcp::socket &socket, const IntervalQueryResult &result) {
+    send_row_description(socket, result);
+    send_data_rows(socket, result);
 }
 
 struct Portal {
@@ -270,22 +316,7 @@ Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
 void send_execution(tcp::socket &socket, const Execution &execution, bool include_description) {
     if (execution.returns_rows) {
         if (include_description) send_result(socket, execution.rows);
-        else {
-            for (const auto &row : execution.rows.rows) {
-                std::string payload;
-                append_u16(payload, static_cast<std::uint16_t>(row.size()));
-                for (const auto &value : row) {
-                    if (std::holds_alternative<std::monostate>(value)) append_u32(payload, 0xffffffff);
-                    else {
-                        const auto text = value_text(value);
-                        append_u32(payload, static_cast<std::uint32_t>(text.size()));
-                        payload.append(text);
-                    }
-                }
-                send_message(socket, 'D', payload);
-            }
-            send_message(socket, 'C', "SELECT " + std::to_string(execution.rows.rows.size()) + '\0');
-        }
+        else send_data_rows(socket, execution.rows);
     } else if (execution.tag.empty()) {
         send_message(socket, 'I', {});
     } else {
@@ -488,7 +519,7 @@ class PostgresServer::Impl {
                             if (keyword == "select" || keyword == "with" || keyword == "show") {
                                 auto execution = execute_sql(*branch_session, found->second.sql, found->second.params);
                                 found->second.described_result = std::move(execution.rows);
-                                send_row_description(socket, found->second.described_result->columns);
+                                send_row_description(socket, *found->second.described_result);
                             } else send_message(socket, 'n', {});
                         } else throw GatewayError("invalid describe target");
                     } else if (type == 'E') {

@@ -41,6 +41,9 @@ using IntervalRows = std::vector<std::vector<IntervalValue>>;
 struct IntervalQueryResult {
     std::vector<std::string> columns;
     IntervalRows rows;
+    // PostgreSQL type OID of each column when the store knows it (0 or absent
+    // otherwise), so wire protocols can describe results accurately.
+    std::vector<std::uint32_t> column_types;
 };
 
 struct IntervalBulkUpsertStats {

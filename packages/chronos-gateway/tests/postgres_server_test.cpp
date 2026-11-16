@@ -421,6 +421,36 @@ int main() {
     expect_cell(connection.get(), "SELECT COUNT(*) FROM orders",
                 0, 0, "3", "schema copying must preserve every visible row");
 
+    // Result columns carry their PostgreSQL types, so ordinary clients parse
+    // booleans, integers, and JSON instead of receiving text.
+    expect_command(connection.get(),
+        "CREATE TABLE typed (id INTEGER PRIMARY KEY, active BOOLEAN, doc JSONB, label TEXT)",
+        "CREATE 0", "typed table must be creatable");
+    expect_command(connection.get(),
+        "INSERT INTO typed (id, active, doc, label) VALUES (1, TRUE, '{\"a\": 1}', 'x')",
+        "INSERT 0 1", "typed table must accept writes");
+    {
+        auto typed = expect_result(connection.get(),
+            "SELECT id, active, doc, label FROM typed", PGRES_TUPLES_OK, "typed SELECT must work");
+        const auto id_type = PQftype(typed.get(), 0);
+        check(id_type == 20 || id_type == 23, "integer columns must be described as integers");
+        check(PQftype(typed.get(), 1) == 16, "boolean columns must be described as bool");
+        check(std::string(PQgetvalue(typed.get(), 0, 1)) == "t", "booleans must travel as t/f");
+        check(PQftype(typed.get(), 2) == 3802, "jsonb columns must be described as jsonb");
+        check(PQftype(typed.get(), 3) == 25, "text columns must be described as text");
+    }
+    {
+        Result prepared(PQprepare(connection.get(), "typed_lookup",
+                                  "SELECT active FROM typed WHERE id = $1", 1, nullptr));
+        check(PQresultStatus(prepared.get()) == PGRES_COMMAND_OK, PQerrorMessage(connection.get()));
+        // PQexecPrepared describes the bound portal, as node-postgres does.
+        const char *values[] = {"1"};
+        Result executed(PQexecPrepared(connection.get(), "typed_lookup", 1, values, nullptr, nullptr, 0));
+        check(PQresultStatus(executed.get()) == PGRES_TUPLES_OK, PQerrorMessage(connection.get()));
+        check(PQftype(executed.get(), 0) == 16, "portal Describe must report column types");
+        check(std::string(PQgetvalue(executed.get(), 0, 0)) == "t", "prepared booleans must travel as t/f");
+    }
+
     // A simple-query error must not poison an autocommit connection.
     auto syntax_error = execute(connection.get(), "SELECT * FROM missing_table");
     check(PQresultStatus(syntax_error.get()) == PGRES_FATAL_ERROR,
