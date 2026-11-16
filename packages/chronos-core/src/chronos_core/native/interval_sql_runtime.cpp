@@ -4264,6 +4264,14 @@ Value eval_ast_value(
     }
     case PG_QUERY__NODE__NODE_COLUMN_REF: {
         const auto name = column_ref_name(node->column_ref);
+        // A qualified reference (excluded.col, alias.col) first matches a row
+        // entry under its qualified name, then falls back to the plain column.
+        const auto *ref = node->column_ref;
+        if (ref->n_fields >= 2 && ref->fields[ref->n_fields - 2] &&
+            ref->fields[ref->n_fields - 2]->node_case == PG_QUERY__NODE__NODE_STRING) {
+            auto qualified = row.find(node_string_value(ref->fields[ref->n_fields - 2]) + "." + name);
+            if (qualified != row.end()) return qualified->second;
+        }
         auto found = row.find(name);
         if (found == row.end()) throw std::runtime_error("unknown column in expression: " + name);
         return found->second;

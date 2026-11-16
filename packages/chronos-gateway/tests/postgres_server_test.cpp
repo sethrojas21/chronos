@@ -347,6 +347,54 @@ int main() {
     expect_cell(connection.get(), "SELECT COUNT(*) FROM orders",
                 0, 0, "3", "DELETE result must be visible");
 
+    // INSERT ... ON CONFLICT (primary key) DO UPDATE: a new key inserts; an
+    // existing key takes the assignments from EXCLUDED and its current values,
+    // and keeps the columns the statement does not assign.
+    expect_command(connection.get(),
+        "INSERT INTO orders (id, customer_id, state, amount, note) VALUES (6, 30, 'open', 10, 'new') "
+        "ON CONFLICT (id) DO UPDATE SET state = excluded.state",
+        "INSERT 0 1", "ON CONFLICT DO UPDATE must insert a new key");
+    expect_command(connection.get(),
+        "INSERT INTO orders AS o (id, customer_id, state, amount) VALUES (6, 31, 'paid', 5), (7, 32, 'open', 1) "
+        "ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, amount = o.amount + excluded.amount",
+        "INSERT 0 2", "ON CONFLICT DO UPDATE must insert and update in one statement");
+    expect_cell(connection.get(), "SELECT state FROM orders WHERE id = 6",
+                0, 0, "paid", "ON CONFLICT DO UPDATE must apply EXCLUDED values");
+    expect_cell(connection.get(), "SELECT amount FROM orders WHERE id = 6",
+                0, 0, "15", "ON CONFLICT DO UPDATE must combine current and EXCLUDED values");
+    expect_cell(connection.get(), "SELECT customer_id FROM orders WHERE id = 6",
+                0, 0, "30", "ON CONFLICT DO UPDATE must keep unassigned columns");
+    expect_cell(connection.get(), "SELECT note FROM orders WHERE id = 6",
+                0, 0, "new", "ON CONFLICT DO UPDATE must keep columns not in the INSERT");
+    {
+        const char *values[] = {"7", "32", "shipped", "1"};
+        Result upserted(PQexecParams(
+            connection.get(),
+            "INSERT INTO orders (id, customer_id, state, amount) VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (id) DO UPDATE SET state = excluded.state",
+            4, nullptr, values, nullptr, nullptr, 0));
+        check(PQresultStatus(upserted.get()) == PGRES_COMMAND_OK,
+              std::string("parameterized ON CONFLICT DO UPDATE must work: ") +
+                  PQresultErrorMessage(upserted.get()));
+        check(std::string(PQcmdStatus(upserted.get())) == "INSERT 0 1",
+              "parameterized ON CONFLICT DO UPDATE must report one row");
+    }
+    expect_cell(connection.get(), "SELECT state FROM orders WHERE id = 7",
+                0, 0, "shipped", "parameterized ON CONFLICT DO UPDATE must update");
+    for (const auto *refused : {
+             "INSERT INTO orders (id, state) VALUES (6, 'x') ON CONFLICT (customer_id) DO UPDATE SET state = excluded.state",
+             "INSERT INTO orders (id, state) VALUES (6, 'x') ON CONFLICT (id) DO UPDATE SET state = excluded.state WHERE orders.amount > 0",
+             "INSERT INTO orders (id, state) VALUES (6, 'x'), (6, 'y') ON CONFLICT (id) DO UPDATE SET state = excluded.state",
+             "INSERT INTO orders (id, state) VALUES (6, 'x') ON CONFLICT (id) DO UPDATE SET id = excluded.id",
+             "INSERT INTO orders (id, state) VALUES (6, 'x') ON CONFLICT DO UPDATE SET state = excluded.state"}) {
+        expect_result(connection.get(), refused, PGRES_FATAL_ERROR,
+                      std::string("unsupported ON CONFLICT DO UPDATE must fail clearly: ") + refused);
+    }
+    expect_cell(connection.get(), "SELECT state FROM orders WHERE id = 6",
+                0, 0, "paid", "a refused ON CONFLICT DO UPDATE must not write");
+    expect_command(connection.get(), "DELETE FROM orders WHERE id IN (6, 7)",
+                   "DELETE 2", "ON CONFLICT DO UPDATE rows must be deletable");
+
     // Branch-local DDL must be usable immediately through the same pgwire
     // session, including the copied schema and its logical indexes.
     expect_command(connection.get(),

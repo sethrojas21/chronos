@@ -43,9 +43,15 @@ struct QueryResult {
 
 struct NativeInsertPlan {
     std::string table;
+    // The table's alias in INSERT INTO t AS alias, for qualified references.
+    std::string alias;
     std::vector<std::string> columns;
     std::vector<std::vector<PgQuery__Node *>> value_tuples;
     bool ignore_conflicts = false;
+    // ON CONFLICT (conflict_columns) DO UPDATE SET conflict_assignments.
+    bool update_on_conflict = false;
+    std::vector<std::string> conflict_columns;
+    std::vector<std::pair<std::string, PgQuery__Node *>> conflict_assignments;
 };
 
 struct NativeUpdatePlan {

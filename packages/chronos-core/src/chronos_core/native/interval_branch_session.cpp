@@ -809,6 +809,27 @@ class NativeBranchSessionImpl {
         return updated;
     }
 
+    // The plain column names of ON CONFLICT (col, ...); arbiter constraints by
+    // name, expressions, and partial-index predicates are not supported.
+    static std::vector<std::string> conflict_target_columns(const PgQuery__InferClause *infer) {
+        if (!infer || infer->n_index_elems == 0) {
+            throw std::runtime_error("ON CONFLICT DO UPDATE requires a conflict target column list");
+        }
+        if (infer->where_clause || (infer->conname && *infer->conname)) {
+            throw std::runtime_error("ON CONFLICT DO UPDATE only supports a plain column conflict target");
+        }
+        std::vector<std::string> columns;
+        for (std::size_t i = 0; i < infer->n_index_elems; ++i) {
+            auto *node = infer->index_elems[i];
+            if (!node || node->node_case != PG_QUERY__NODE__NODE_INDEX_ELEM ||
+                !node->index_elem->name || node->index_elem->expr) {
+                throw std::runtime_error("ON CONFLICT DO UPDATE only supports a plain column conflict target");
+            }
+            columns.emplace_back(node->index_elem->name);
+        }
+        return columns;
+    }
+
     NativeInsertPlan build_insert_plan(PgQuery__InsertStmt *stmt) {
         if (!stmt || !stmt->relation) throw std::runtime_error("INSERT must specify a table");
         if (stmt->with_clause || stmt->n_returning_list > 0) {
@@ -824,11 +845,30 @@ class NativeBranchSessionImpl {
             plan.columns.emplace_back(node->res_target->name);
         }
         if (plan.columns.empty()) throw std::runtime_error("INSERT must specify a column list");
+        if (stmt->relation->alias && stmt->relation->alias->aliasname) {
+            plan.alias = stmt->relation->alias->aliasname;
+        }
         if (stmt->on_conflict_clause) {
-            if (stmt->on_conflict_clause->action == PG_QUERY__ON_CONFLICT_ACTION__ONCONFLICT_NOTHING) {
+            const auto *conflict = stmt->on_conflict_clause;
+            if (conflict->action == PG_QUERY__ON_CONFLICT_ACTION__ONCONFLICT_NOTHING) {
                 plan.ignore_conflicts = true;
+            } else if (conflict->action == PG_QUERY__ON_CONFLICT_ACTION__ONCONFLICT_UPDATE) {
+                plan.update_on_conflict = true;
+                plan.conflict_columns = conflict_target_columns(conflict->infer);
+                if (conflict->where_clause) {
+                    throw std::runtime_error("native ON CONFLICT DO UPDATE does not support WHERE");
+                }
+                for (std::size_t i = 0; i < conflict->n_target_list; ++i) {
+                    auto *node = conflict->target_list[i];
+                    if (!node || node->node_case != PG_QUERY__NODE__NODE_RES_TARGET ||
+                        !node->res_target->name || node->res_target->n_indirection > 0 ||
+                        !node->res_target->val) {
+                        throw std::runtime_error("ON CONFLICT DO UPDATE only supports simple column assignments");
+                    }
+                    plan.conflict_assignments.emplace_back(node->res_target->name, node->res_target->val);
+                }
             } else {
-                throw std::runtime_error("native INSERT only supports ON CONFLICT DO NOTHING");
+                throw std::runtime_error("unsupported native ON CONFLICT action");
             }
         }
         if (!stmt->select_stmt || stmt->select_stmt->node_case != PG_QUERY__NODE__NODE_SELECT_STMT) {
@@ -2139,8 +2179,12 @@ class NativeBranchSessionImpl {
         }
     }
 
-    std::int64_t execute_insert(const NativeInsertPlan &plan, const std::vector<Value> &params) {
-        NativeTableMeta meta = table_meta_for(plan.table);
+    // Each VALUES tuple as a full table row: listed columns, then column
+    // defaults, then NULL.
+    NativeRows proposed_insert_rows(
+        const NativeInsertPlan &plan,
+        const NativeTableMeta &meta,
+        const std::vector<Value> &params) {
         const auto defaults = column_default_values(meta);
         NativeRows rows;
         std::unordered_map<std::string, Value> empty_row;
@@ -2163,6 +2207,92 @@ class NativeBranchSessionImpl {
             }
             rows.push_back(std::move(row));
         }
+        return rows;
+    }
+
+    // INSERT ... ON CONFLICT (primary key) DO UPDATE SET ... with PostgreSQL's
+    // meaning: a new key is inserted; an existing visible row takes the
+    // assignments, evaluated over its current values (plain or table-qualified
+    // names) and the proposed row (excluded.col). Both writes go through the
+    // same interval paths as INSERT and UPDATE, in one transaction.
+    std::int64_t execute_insert_on_conflict_update(
+        const NativeInsertPlan &plan,
+        const std::vector<Value> &params) {
+        NativeTableMeta meta = table_meta_for(plan.table);
+        const std::unordered_set<std::string> primary_key(meta.pk_columns.begin(), meta.pk_columns.end());
+        const std::unordered_set<std::string> target(plan.conflict_columns.begin(), plan.conflict_columns.end());
+        if (target != primary_key || target.size() != plan.conflict_columns.size()) {
+            throw std::runtime_error("ON CONFLICT DO UPDATE target must be the table's primary key");
+        }
+        std::vector<std::pair<std::size_t, PgQuery__Node *>> assignments;
+        for (const auto &[column, expr] : plan.conflict_assignments) {
+            if (primary_key.count(column)) {
+                throw std::runtime_error("ON CONFLICT DO UPDATE cannot change primary key columns");
+            }
+            assignments.emplace_back(column_index(meta.columns, column), expr);
+        }
+        std::string key_where;
+        std::vector<std::size_t> key_indices;
+        for (const auto &column : meta.pk_columns) {
+            if (!key_where.empty()) key_where += " AND ";
+            key_where += quote_ident(column) + " = ?";
+            key_indices.push_back(column_index(meta.columns, column));
+        }
+
+        const NativeRows proposed = proposed_insert_rows(plan, meta, params);
+        std::unordered_map<NativeRowKey, bool, NativeRowKeyHash> seen;
+        for (const auto &row : proposed) {
+            if (!seen.emplace(row_key_for_meta(meta, row), true).second) {
+                throw std::runtime_error("ON CONFLICT DO UPDATE command cannot affect row a second time");
+            }
+        }
+
+        SubqueryEvaluator evaluator = [this, &params](const PgQuery__SelectStmt *select) {
+            return this->evaluate_select_values(select, params);
+        };
+        const bool started_tx = !store_.driver().in_transaction();
+        if (started_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        try {
+            NativeRows inserts;
+            NativeRows updates;
+            for (const auto &row : proposed) {
+                std::vector<Value> key;
+                for (auto index : key_indices) key.push_back(row[index]);
+                auto existing = select_visible_rows(meta, key_where, key, meta.columns);
+                if (existing.rows.empty()) {
+                    inserts.push_back(row);
+                    continue;
+                }
+                auto current = std::move(existing.rows.front());
+                auto row_map = row_map_for(meta.columns, current);
+                for (std::size_t i = 0; i < meta.columns.size(); ++i) {
+                    row_map["excluded." + meta.columns[i]] = row[i];
+                    row_map[plan.table + "." + meta.columns[i]] = current[i];
+                    if (!plan.alias.empty()) row_map[plan.alias + "." + meta.columns[i]] = current[i];
+                }
+                auto updated = current;
+                for (const auto &[index, expr] : assignments) {
+                    updated[index] = eval_ast_value(expr, row_map, params, &evaluator);
+                }
+                updates.push_back(std::move(updated));
+            }
+            std::int64_t count = insert_rows(plan.table, meta.columns, meta.pk_columns, inserts, false);
+            if (!updates.empty()) {
+                upsert_rows(plan.table, meta.columns, meta.pk_columns, updates, false);
+                count += static_cast<std::int64_t>(updates.size());
+            }
+            commit_if_started(started_tx);
+            return count;
+        } catch (...) {
+            rollback_if_started(started_tx);
+            throw;
+        }
+    }
+
+    std::int64_t execute_insert(const NativeInsertPlan &plan, const std::vector<Value> &params) {
+        if (plan.update_on_conflict) return execute_insert_on_conflict_update(plan, params);
+        NativeTableMeta meta = table_meta_for(plan.table);
+        const NativeRows rows = proposed_insert_rows(plan, meta, params);
         std::unordered_map<NativeRowKey, bool, NativeRowKeyHash> seen;
         NativeRows candidate_rows;
         for (const auto &row : rows) {

@@ -155,7 +155,11 @@ printf 'SELECT * FROM items' | chronos query --store app
 
 `upsert --store NAME TABLE ROWS` calls the branch session's `upsert_rows()`: rows
 are a JSON array of objects, inserted or replaced by the table's registered
-primary key. Use it where SQL `INSERT ... ON CONFLICT DO UPDATE` is not accepted.
+primary key. SQL `INSERT ... ON CONFLICT (primary key columns) DO UPDATE SET ...`
+also works through `execute`, with PostgreSQL's meaning: `EXCLUDED.col` is the
+proposed value, a plain or table-qualified column is the current value, and
+columns the statement does not assign are kept. The conflict target must be the
+table's primary key; a `WHERE` on the update is not supported.
 `transaction --store NAME OPERATIONS` runs several writes on one branch inside the
 session's `transaction()`, so they commit or roll back together. Operations are
 a JSON array; each one is keyed by the command it stands for:

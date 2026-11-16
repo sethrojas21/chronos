@@ -690,6 +690,33 @@ class TestWorkspaceSQLWorkflows:
         _close_sessions()
         assert invoke("query", keys, *on_agent) == [{"key": "c"}]
 
+    def test_insert_on_conflict_do_update(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "--store", "app",
+               "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, hits INTEGER, note TEXT)")
+        invoke("table", "register", "--store", "app", "items", "--primary-key", "id")
+        invoke("execute", "--store", "app", "INSERT INTO items (id, name, hits, note) VALUES (1, 'a', 1, 'kept')")
+        invoke("branch", "create", "agent")
+        upsert = ("INSERT INTO items (id, name, hits) VALUES (:id, :name, :hits) "
+                  "ON CONFLICT (id) DO UPDATE SET name = excluded.name, hits = items.hits + excluded.hits")
+        assert invoke("execute", "--store", "app", "--branch", "agent", upsert,
+                      "--params", '{"id": 1, "name": "b", "hits": 2}') == {"rowcount": 1}
+        assert invoke("execute", "--store", "app", "--branch", "agent", upsert,
+                      "--params", '{"id": 2, "name": "c", "hits": 5}') == {"rowcount": 1}
+        assert invoke("query", "--store", "app", "--branch", "agent", "SELECT * FROM items ORDER BY id") == [
+            {"id": 1, "name": "b", "hits": 3, "note": "kept"},
+            {"id": 2, "name": "c", "hits": 5, "note": None},
+        ]
+        # The upsert stays on its branch.
+        assert invoke("query", "--store", "app", "SELECT * FROM items ORDER BY id") == [
+            {"id": 1, "name": "a", "hits": 1, "note": "kept"},
+        ]
+        # A conflict target other than the primary key is refused.
+        invoke("execute", "--store", "app", "--branch", "agent",
+               "INSERT INTO items (id, name) VALUES (1, 'x') ON CONFLICT (name) DO UPDATE SET name = excluded.name",
+               ok=False)
+
     def test_bytes_round_trip(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)
