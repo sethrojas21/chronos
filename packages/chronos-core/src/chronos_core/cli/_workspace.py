@@ -16,6 +16,7 @@ from chronos_core.cli._config import (
     DatabaseConfig, QdrantConfig, WorkspaceConfig, WorkspaceConfigError, load_workspace_config, open_workspace,
 )
 from chronos_core.cli._terminal import MergePolicy, json_object_option, print_result, report_error
+from chronos_core.control import operations
 
 if TYPE_CHECKING:
     from chronos_core.workspace import ChronosWorkspaceContext
@@ -288,7 +289,7 @@ def list_branches(ctx: typer.Context, store: str | None = typer.Option(
     None, "--store", help="List one relational store's branch records, including metadata.",
 )) -> None:
     with connect_workspace(ctx, store) as workspace:
-        print_result(workspace.list_branches() if store is None else workspace.stores[store].list_branches())
+        print_result(operations.list_branches(workspace, store))
 
 
 @branch_app.command("create")
@@ -296,7 +297,7 @@ def create_branch(ctx: typer.Context, name: str, from_branch: str = typer.Option
                   metadata: str | None = typer.Option(None, "--metadata")) -> None:
     values = json_object_option(metadata, "--metadata")
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.create_branch(name, from_branch=from_branch, metadata=values))
+        print_result(operations.create_branch(workspace, name, from_branch, values))
 
 
 @branch_app.command("update-metadata")
@@ -304,19 +305,19 @@ def update_branch_metadata(ctx: typer.Context, name: str, metadata: str,
                            store: str = typer.Option(..., "--store")) -> None:
     values = json_object_option(metadata, "METADATA")
     with connect_workspace(ctx, store) as workspace:
-        print_result(workspace.stores[store].update_branch_metadata(name, values))
+        print_result(operations.update_branch_metadata(workspace, store, name, values))
 
 
 @branch_app.command("create-from-checkpoint")
 def create_branch_from_checkpoint(ctx: typer.Context, name: str, checkpoint: str) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.create_branch_from_checkpoint(name, checkpoint))
+        print_result(operations.create_branch_from_checkpoint(workspace, name, checkpoint))
 
 
 @branch_app.command("delete")
 def delete_branch(ctx: typer.Context, name: str) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.delete_branch(name))
+        print_result(operations.delete_branch(workspace, name))
 
 
 @checkpoint_app.command("create")
@@ -324,7 +325,7 @@ def create_checkpoint(ctx: typer.Context, name: str, branch: str = typer.Option(
                       metadata: str | None = typer.Option(None, "--metadata")) -> None:
     values = json_object_option(metadata, "--metadata")
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.create_checkpoint(name, branch=branch, metadata=values))
+        print_result(operations.create_checkpoint(workspace, name, branch, values))
 
 
 @checkpoint_app.command("list")
@@ -333,33 +334,33 @@ def list_checkpoints(ctx: typer.Context, store: str = typer.Option(..., "--store
                      metadata_filter: str | None = typer.Option(None, "--metadata-filter")) -> None:
     values = json_object_option(metadata_filter, "--metadata-filter")
     with connect_workspace(ctx, store) as workspace:
-        print_result(workspace.stores[store].list_checkpoints(branch, values))
+        print_result(operations.list_checkpoints(workspace, store, branch, values))
 
 
 def diff(ctx: typer.Context, left: str, right: str) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.diff(left, right))
+        print_result(operations.diff(workspace, left, right))
 
 
 @merge_app.command("preview")
 def merge_preview(ctx: typer.Context, source: str, target: str,
                   policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_preview(source, target, policy=policy.api_value))
+        print_result(operations.merge_preview(workspace, source, target, policy.api_value))
 
 
 @merge_app.command("apply")
 def merge_apply(ctx: typer.Context, source: str, target: str,
                 policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_apply(source, target, policy=policy.api_value))
+        print_result(operations.merge_apply(workspace, source, target, policy.api_value))
 
 
 @merge_app.command("atomic-preview")
 def merge_atomic_preview(ctx: typer.Context, source: str, target: str,
                          policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_atomic_preview(source, target, policy=policy.api_value))
+        print_result(operations.merge_atomic_preview(workspace, source, target, policy.api_value))
 
 
 @merge_app.command("atomic-apply")
@@ -370,8 +371,9 @@ def merge_atomic(
     policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy"),
 ) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(workspace.merge_atomic(
-            source, target, operation_id=operation_id, preview_token=preview_token, policy=policy.api_value,
+        print_result(operations.merge_atomic(
+            workspace, source, target, operation_id=operation_id, preview_token=preview_token,
+            policy=policy.api_value,
         ))
 
 

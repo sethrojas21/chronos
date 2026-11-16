@@ -11,6 +11,7 @@ import typer
 from sqlglot import exp
 
 from chronos_core.cli._terminal import decode_bytes, print_result, read_json_input
+from chronos_core.control import operations
 from chronos_core.cli._workspace import (
     begin_transaction, connect_workspace, end_transaction, held_workspace, store_session,
 )
@@ -82,13 +83,13 @@ def create_table(
 def register_table(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store"),
                    primary_key: list[str] = typer.Option(..., "--primary-key")) -> None:
     with connect_workspace(ctx, store) as workspace:
-        print_result(workspace.stores[store].register_table(table, primary_key))
+        print_result(operations.register_table(workspace, store, table, primary_key))
 
 
 @table_app.command("info")
 def table_info(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store")) -> None:
     with connect_workspace(ctx, store) as workspace:
-        print_result(workspace.stores[store].describe_table(table))
+        print_result(operations.table_info(workspace, store, table))
 
 
 def query(

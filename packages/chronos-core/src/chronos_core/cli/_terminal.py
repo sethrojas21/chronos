@@ -5,15 +5,14 @@ import base64
 import json
 import re
 import sys
-from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, time
-from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import typer
+
+from chronos_core.control.encoding import json_default
 
 
 class MergePolicy(str, Enum):
@@ -24,18 +23,6 @@ class MergePolicy(str, Enum):
     @property
     def api_value(self) -> str | None:
         return None if self is MergePolicy.api_default else self.value
-
-
-def _json_default(value: Any) -> Any:
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, bytes):
-        return {"encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
-    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}")
 
 
 def read_json_input(text: str | None, file: Path | None, stdin: bool) -> Any:
@@ -92,7 +79,7 @@ def decode_bytes(values: dict[str, Any], param_hint: str | None = None) -> dict[
 
 def print_result(result: Any) -> None:
     if result is not None:
-        typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2, allow_nan=False))
+        typer.echo(json.dumps(result, default=json_default, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def report_error(
