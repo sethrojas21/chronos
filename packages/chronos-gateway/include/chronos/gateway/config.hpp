@@ -18,6 +18,9 @@ struct ListenAddress {
 struct GatewayConfig {
     ListenAddress control;
     ListenAddress postgres;
+    // The host:port clients use to reach the PostgreSQL listener, for database
+    // URLs behind NAT or container port mapping; empty means the listener.
+    ListenAddress postgres_advertised;
     // Without an nfs listener the gateway serves only control and PostgreSQL;
     // no workspace may then configure a filesystem.
     bool nfs_enabled = true;

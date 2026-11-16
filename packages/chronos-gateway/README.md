@@ -10,6 +10,20 @@ The API follows the existing workspace lifecycle. For example,
 `POST /v1/workspaces/training/branches` corresponds to
 `workspace.create_branch(...)`; SQL and NFS both check out the returned branch.
 
+## Running locally with Docker
+
+`docker/run-local.sh` builds the gateway in a Linux container (the same
+environment as CI) and runs a SQL-only gateway backed by PostgreSQL 18, also in
+Docker. It works on macOS. The control API is published on `127.0.0.1:7400`
+and the PostgreSQL wire port on `localhost:6543`, with workspace `local` and
+SQL store `app`. Use `run-local.sh rebuild` after code changes and
+`run-local.sh stop` to stop it.
+
+A config without an `nfs` listener runs only the control API and the
+PostgreSQL frontend; workspaces in it cannot configure a filesystem. Behind NAT
+or container port mapping, set `listeners.postgres_advertise` to the
+`host:port` clients should put in database URLs.
+
 ## Sandbox and long-lived branches
 
 By default a created branch is a sandbox: a terminal branch owned by its

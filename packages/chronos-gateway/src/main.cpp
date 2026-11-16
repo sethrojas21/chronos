@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
             chronos::gateway::ControlServer server(
                 runtime,
                 config.control,
-                config.postgres,
+                config.postgres_advertised.host.empty() ? config.postgres : config.postgres_advertised,
                 config.nfs,
                 config.controller_token);
             chronos::gateway::PostgresServer postgres_server(runtime, config.postgres);

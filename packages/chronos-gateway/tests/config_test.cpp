@@ -85,7 +85,8 @@ int main() {
     {
         std::ofstream output(path);
         output << R"JSON({
-  "listeners": {"control": "127.0.0.1:17400", "postgres": "127.0.0.1:15432"},
+  "listeners": {"control": "127.0.0.1:17400", "postgres": "127.0.0.1:15432",
+                "postgres_advertise": "localhost:6543"},
   "controller_token_env": "TEST_GATEWAY_TOKEN",
   "workspaces": {"agents": {"metadata_url_env": "TEST_METADATA_URL",
                             "postgres": {"app": {"data_url_env": "TEST_ORDERS_URL"}}}}
@@ -93,6 +94,9 @@ int main() {
     }
     auto sql_only = load_config(path);
     check(!sql_only.nfs_enabled, "a config without an nfs listener must disable NFS");
+    check(sql_only.postgres_advertised.endpoint() == "localhost:6543",
+          "the advertised PostgreSQL address may be a host name");
+    check(config.postgres_advertised.host.empty(), "the advertised address must default to the listener");
     check(sql_only.workspaces.at("agents").postgres_stores.count("app") == 1,
           "a SQL-only workspace must parse");
     {

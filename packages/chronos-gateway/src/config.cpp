@@ -22,6 +22,28 @@ std::string required_env(const std::string &name) {
     return value;
 }
 
+// host:port where host may also be a DNS name; it is only placed in URLs.
+ListenAddress parse_advertised_address(const std::string &text, const std::string &label) {
+    const auto separator = text.rfind(':');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == text.size()) {
+        throw GatewayError(label + " must have the form host:port");
+    }
+    ListenAddress result;
+    result.host = text.substr(0, separator);
+    if (result.host.find_first_of("/@?# \t\r\n") != std::string::npos) {
+        throw GatewayError(label + " host contains unsafe characters");
+    }
+    try {
+        std::size_t consumed = 0;
+        const auto port = std::stoul(text.substr(separator + 1), &consumed);
+        if (consumed != text.size() - separator - 1 || port == 0 || port > 65535) throw std::out_of_range(label);
+        result.port = static_cast<std::uint16_t>(port);
+    } catch (const std::exception &) {
+        throw GatewayError(label + " port must be between 1 and 65535");
+    }
+    return result;
+}
+
 ListenAddress parse_address(const std::string &text, const std::string &label) {
     const auto separator = text.rfind(':');
     if (separator == std::string::npos || separator == 0 || separator + 1 == text.size()) {
@@ -87,6 +109,10 @@ GatewayConfig load_config(const std::string &path) {
     const auto &listeners = root.at("listeners");
     config.control = parse_address(listeners.at("control").get<std::string>(), "control listener");
     config.postgres = parse_address(listeners.at("postgres").get<std::string>(), "postgres listener");
+    if (listeners.contains("postgres_advertise")) {
+        config.postgres_advertised = parse_advertised_address(
+            listeners.at("postgres_advertise").get<std::string>(), "postgres_advertise");
+    }
     config.nfs_enabled = listeners.contains("nfs");
     if (config.nfs_enabled) {
         config.nfs = parse_address(listeners.at("nfs").get<std::string>(), "nfs listener");
