@@ -547,6 +547,40 @@ class TestWorkspaceCommands:
             (("INSERT INTO catalog (key) VALUES (:key)", {"key": "a"}),), (("DELETE FROM stale", None),),
         ]
 
+    def test_tagged_bytes_are_decoded_on_input(self, workspace_connection: MagicMock) -> None:
+        session = workspace_connection.checkout.return_value.stores["app"]
+        session.upsert_rows.return_value = None
+        tagged = {"encoding": "base64", "data": "AP8K"}
+        rows = json.dumps([{"id": 1, "blob": tagged, "doc": {"encoding": "utf-8", "data": "x"}}])
+        result = runner.invoke(app, ["upsert", "items", rows, "--store", "app"])
+        assert result.exit_code == 0, result.output
+        # Only the exact two-key base64 tag becomes bytes; other objects stay JSON.
+        session.upsert_rows.assert_called_once_with(
+            "items", [{"id": 1, "blob": b"\x00\xff\n", "doc": {"encoding": "utf-8", "data": "x"}}],
+        )
+        result = runner.invoke(app, ["execute", "UPDATE items SET blob = :blob", "--store", "app",
+                                     "--params", json.dumps({"blob": tagged})])
+        assert result.exit_code == 0, result.output
+        session.execute.assert_called_with("UPDATE items SET blob = :blob", {"blob": b"\x00\xff\n"})
+        operations = json.dumps([
+            {"execute": "UPDATE items SET blob = :blob", "params": {"blob": tagged}},
+            {"upsert": "items", "rows": [{"id": 2, "blob": tagged}]},
+        ])
+        result = runner.invoke(app, ["transaction", operations, "--store", "app"])
+        assert result.exit_code == 0, result.output
+        assert session.execute.call_args.args == ("UPDATE items SET blob = :blob", {"blob": b"\x00\xff\n"})
+        assert session.upsert_rows.call_args.args == ("items", [{"id": 2, "blob": b"\x00\xff\n"}])
+
+    @pytest.mark.parametrize("args", [
+        ["upsert", "items", '[{"blob": {"encoding": "base64", "data": "not base64!"}}]', "--store", "app"],
+        ["upsert", "items", '[{"blob": {"encoding": "base64", "data": 5}}]', "--store", "app"],
+        ["query", "SELECT :b", "--store", "app", "--params", '{"b": {"encoding": "base64", "data": "%%"}}'],
+    ])
+    def test_invalid_tagged_bytes_do_not_open_stores(self, workspace_connection: MagicMock, args: list[str]) -> None:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2, result.output
+        _workspace.open_workspace.assert_not_called()
+
     def test_transaction_failure_prints_nothing(self, workspace_connection: MagicMock) -> None:
         session = workspace_connection.checkout.return_value.stores["app"]
         session.execute.side_effect = BranchingError("statement failed")

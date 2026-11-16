@@ -72,6 +72,24 @@ def json_object_option(value: str | None, param_hint: str) -> dict[str, Any] | N
     return result
 
 
+def decode_bytes(values: dict[str, Any], param_hint: str | None = None) -> dict[str, Any]:
+    """Turn tagged base64 objects, the form print_result uses for bytes, back into bytes.
+
+    Only an object with exactly the keys "encoding": "base64" and "data" is decoded,
+    and only as a top-level value of a parameter object or row.
+    """
+    decoded = dict(values)
+    for key, value in values.items():
+        if isinstance(value, dict) and set(value) == {"encoding", "data"} and value["encoding"] == "base64":
+            if not isinstance(value["data"], str):
+                raise typer.BadParameter(f"{key}: base64 data must be a string.", param_hint=param_hint)
+            try:
+                decoded[key] = base64.b64decode(value["data"], validate=True)
+            except (ValueError, TypeError) as error:
+                raise typer.BadParameter(f"{key}: invalid base64 data.", param_hint=param_hint) from error
+    return decoded
+
+
 def print_result(result: Any) -> None:
     if result is not None:
         typer.echo(json.dumps(result, default=_json_default, ensure_ascii=False, indent=2, allow_nan=False))

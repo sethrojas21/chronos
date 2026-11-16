@@ -202,6 +202,20 @@ redirected to a file.
 Non-finite floats returned by the API fail clearly because JSON cannot represent
 them; query execution and the API's returned values are not modified.
 
+Bytes use one tagged form in both directions: `{"encoding": "base64", "data":
+"<base64>"}`. Results print bytes this way, and the same object is accepted as a
+value in `--params`, in `upsert` rows, and in `transaction` operations, where it
+is decoded to bytes before calling the API. A query result can therefore be
+written back unchanged. Only an object with exactly those two keys and
+`"encoding": "base64"` is decoded, and only as a top-level value of a parameter
+object or row; any other object stays JSON. Invalid base64 is a usage error
+(exit code 2).
+
+```sh
+chronos upsert files '[{"id": 1, "data": {"encoding": "base64", "data": "AP8KYQ=="}}]' --store app
+chronos query --store app 'SELECT data FROM files WHERE id = :id' --params '{"id": 1}'
+```
+
 ## Persistent mode
 
 Each ordinary invocation opens and closes the workspace. For many small calls,

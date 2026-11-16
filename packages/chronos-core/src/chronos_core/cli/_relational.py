@@ -10,7 +10,7 @@ import sqlglot
 import typer
 from sqlglot import exp
 
-from chronos_core.cli._terminal import print_result, read_json_input
+from chronos_core.cli._terminal import decode_bytes, print_result, read_json_input
 from chronos_core.cli._workspace import (
     begin_transaction, connect_workspace, end_transaction, held_workspace, store_session,
 )
@@ -47,7 +47,7 @@ def _parameters(params: str | None) -> dict[str, Any] | None:
         raise typer.BadParameter("Expected a JSON object.", param_hint="--params") from error
     if not isinstance(value, dict):
         raise typer.BadParameter("Expected a JSON object.", param_hint="--params")
-    return value
+    return decode_bytes(value, "--params")
 
 
 def _create_table_input(sql: str | None, file: Path | None, stdin: bool) -> str:
@@ -118,7 +118,7 @@ def execute(
 def _rows_input(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
         raise typer.BadParameter("Expected a JSON array of row objects.")
-    return value
+    return [decode_bytes(row) for row in value]
 
 
 def _transaction_input(value: Any) -> list[tuple[str, Any, Any]]:
@@ -131,7 +131,7 @@ def _transaction_input(value: Any) -> list[tuple[str, Any, Any]]:
             sql, params = item["execute"], item.get("params")
             if not isinstance(sql, str) or not sql.strip() or not (params is None or isinstance(params, dict)):
                 raise typer.BadParameter(f"Operation {index}: execute needs SQL text and optional params object.")
-            operations.append(("execute", sql, params))
+            operations.append(("execute", sql, None if params is None else decode_bytes(params)))
         elif isinstance(item, dict) and set(item) == {"upsert", "rows"}:
             if not isinstance(item["upsert"], str) or not item["upsert"].strip():
                 raise typer.BadParameter(f"Operation {index}: upsert needs a table name.")

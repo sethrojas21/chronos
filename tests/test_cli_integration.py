@@ -690,6 +690,23 @@ class TestWorkspaceSQLWorkflows:
         _close_sessions()
         assert invoke("query", keys, *on_agent) == [{"key": "c"}]
 
+    def test_bytes_round_trip(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        config = _workspace_config_file(tmp_path, cli_database)
+        invoke = partial(_invoke_workspace, config)
+        blob = "BYTEA" if urlsplit(cli_database.database_url).scheme in {"postgres", "postgresql"} else "BLOB"
+        invoke("table", "create", "--store", "app", f"CREATE TABLE files (id INTEGER PRIMARY KEY, data {blob})")
+        invoke("table", "register", "--store", "app", "files", "--primary-key", "id")
+        payload = {"encoding": "base64", "data": "AP8KYQ=="}  # bytes 00 ff 0a 61
+        invoke("upsert", "files", json.dumps([{"id": 1, "data": payload}]), "--store", "app")
+        invoke("execute", "INSERT INTO files (id, data) VALUES (:id, :data)", "--store", "app",
+               "--params", json.dumps({"id": 2, "data": payload}))
+        # Output uses the same tag, so a query result can be written back unchanged.
+        assert invoke("query", "SELECT id, data FROM files ORDER BY id", "--store", "app") == [
+            {"id": 1, "data": payload}, {"id": 2, "data": payload},
+        ]
+        assert invoke("query", "SELECT id FROM files WHERE data = :data", "--store", "app",
+                      "--params", json.dumps({"data": payload})) == [{"id": 1}, {"id": 2}]
+
     def test_upsert_transaction_and_metadata(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)
