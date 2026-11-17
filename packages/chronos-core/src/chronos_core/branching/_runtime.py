@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 
 from chronos_core.branching._common import *
-from chronos_core.branching._common import _parse_table_registry
+from chronos_core.branching._common import _parse_index_registry, _parse_table_registry
 from chronos_core.branching._copy_backend import _CopyBackend
 from chronos_core.branching._interval_backend import _IntervalBackend
 from chronos_core.branching._litetree_backend import _LiteTreeBackend
@@ -602,8 +602,9 @@ class ChronosBranchContext:
     def describe_table(self, table: str) -> TableInfo:
         """Describe a table from Chronos's registry, or the database if unregistered.
 
-        The registry is reread so a table registered by another process is
-        reported. Unregistered tables have no Chronos primary key.
+        The registries are reread so a table or index registered by another
+        process is reported. Unregistered tables have no Chronos primary key
+        or indexes.
         """
 
         if getattr(self._backend, "enable_schema_branching", False):
@@ -612,9 +613,16 @@ class ChronosBranchContext:
                 "branch-local schemas are enabled"
             )
         meta = _parse_table_registry(self._backend.db, self._backend.name).get(table)
+        indexes: tuple[IndexInfo, ...] = ()
         if meta is not None:
             names, defs = meta.columns, meta.column_defs
             primary_key: tuple[str, ...] | None = meta.pk_columns
+            registry = _parse_index_registry(self._backend.db, self._backend.name)
+            indexes = tuple(
+                IndexInfo(index.name, index.table, index.columns, index.backend)
+                for _, index in sorted(registry.items())
+                if index.table == table
+            )
         else:
             names, defs = self._db.table_defs(table)
             primary_key = None
@@ -631,6 +639,7 @@ class ChronosBranchContext:
             registered=meta is not None,
             primary_key=primary_key,
             columns=tuple(columns),
+            indexes=indexes,
         )
 
     def create_index(

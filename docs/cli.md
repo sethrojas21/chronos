@@ -123,7 +123,7 @@ application data; direct access to the original table bypasses Chronos.
 
 `table info --store NAME TABLE` calls `describe_table()` and prints whether the
 table exists, whether it is registered, its primary key, and its columns as
-`name`/`type` pairs. Registered tables are described from Chronos's table
+`name`/`type` pairs, and its Chronos indexes. Registered tables are described from Chronos's table
 registry, reread on every call, so the answer is current right after
 registration, including registration by another process. A table that exists
 but is not registered is described from the database, with `primary_key` set to
@@ -137,7 +137,17 @@ chronos table info --store app items
 
 ```json
 {"table": "items", "exists": true, "registered": true, "primary_key": ["id"],
- "columns": [{"name": "id", "type": "INTEGER"}, {"name": "value", "type": "TEXT"}]}
+ "columns": [{"name": "id", "type": "INTEGER"}, {"name": "value", "type": "TEXT"}],
+ "indexes": [{"name": "items_value", "table": "items", "columns": ["value"], "backend": "interval"}]}
+```
+
+`table index --store NAME TABLE --column COL` calls `create_index()` on a
+registered table and prints the index; repeat `--column` for a multi-column
+index and pass `--name` to choose its name. Chronos maintains the index on
+every branch. Partial (`WHERE`) and unique indexes are not supported.
+
+```sh
+chronos table index --store app items --column value --name items_value
 ```
 
 SQL accepts text, `--file PATH`, or `--stdin`. Piped input is read automatically

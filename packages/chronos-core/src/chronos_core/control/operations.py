@@ -74,5 +74,10 @@ def register_table(workspace: ChronosWorkspaceContext, store: str, table: str, p
     return workspace.stores[store].register_table(table, primary_key)
 
 
+def create_index(workspace: ChronosWorkspaceContext, store: str, table: str, columns: list[str],
+                 name: str | None = None) -> Any:
+    return workspace.stores[store].create_index(table, columns, name)
+
+
 def table_info(workspace: ChronosWorkspaceContext, store: str, table: str) -> Any:
     return workspace.stores[store].describe_table(table)

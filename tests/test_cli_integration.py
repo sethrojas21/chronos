@@ -607,15 +607,18 @@ class TestWorkspaceSQLWorkflows:
         one_shot = partial(_run_cli, environment=environment)
         assert invoke("table", "info", "skill", "--store", "app") == {
             "table": "skill", "exists": False, "registered": False, "primary_key": None, "columns": [],
+            "indexes": [],
         }
         invoke("table", "create", "--store", "app", "CREATE TABLE skill (key TEXT PRIMARY KEY, body TEXT, n INTEGER NOT NULL)")
         text = "VARCHAR" if cli_database.database_url.startswith("duckdb") else "TEXT"
         columns = [{"name": "key", "type": text}, {"name": "body", "type": text}, {"name": "n", "type": "INTEGER"}]
         assert invoke("table", "info", "skill", "--store", "app") == {
             "table": "skill", "exists": True, "registered": False, "primary_key": None, "columns": columns,
+            "indexes": [],
         }
         invoke("table", "register", "--store", "app", "skill", "--primary-key", "key")
-        registered = {"table": "skill", "exists": True, "registered": True, "primary_key": ["key"], "columns": columns}
+        registered = {"table": "skill", "exists": True, "registered": True, "primary_key": ["key"],
+                      "columns": columns, "indexes": []}
         # Correct right after registration, in the same persistent process and in a new one.
         assert invoke("table", "info", "skill", "--store", "app") == registered
         assert one_shot(["table", "info", "skill", "--store", "app"]) == registered
@@ -623,6 +626,15 @@ class TestWorkspaceSQLWorkflows:
         invoke("branch", "create", "agent")
         invoke("upsert", "skill", '[{"key": "a", "body": "x", "n": 1}]', "--store", "app", "--branch", "agent")
         assert invoke("table", "info", "skill", "--store", "app") == registered
+        # Indexes on several columns, named or not, are listed by name.
+        by_body = invoke("table", "index", "skill", "--store", "app", "--column", "body", "--column", "n",
+                         "--name", "skill_body_n")
+        assert by_body["name"] == "skill_body_n" and by_body["columns"] == ["body", "n"]
+        unnamed = invoke("table", "index", "skill", "--store", "app", "--column", "n")
+        info = invoke("table", "info", "skill", "--store", "app")
+        assert [index["name"] for index in info["indexes"]] == sorted(["skill_body_n", unnamed["name"]])
+        assert one_shot(["table", "info", "skill", "--store", "app"]) == info
+        invoke("table", "index", "missing", "--store", "app", "--column", "n", ok=False)
         if not cli_database.database_url.startswith("duckdb"):
             # DuckDB admits one process at a time; elsewhere an already open context
             # rereads the registry after another process registers a table.
@@ -645,6 +657,7 @@ class TestWorkspaceSQLWorkflows:
         # Reads inside the transaction see its writes; rollback discards them.
         invoke("begin", *on_agent)
         invoke("table", "info", "skill", "--store", "app", ok=False)
+        invoke("table", "index", "skill", "--store", "app", "--column", "body", ok=False)
         invoke("query", "SELECT 1 AS one", "--store", "app", ok=False)  # branch main, not the open one
         invoke("execute", "INSERT INTO skill (key, body) VALUES ('a', 'x')", *on_agent)
         invoke("upsert", "skill", '[{"key": "b", "body": "y"}]', *on_agent)

@@ -279,6 +279,8 @@ class TableInfo:
     registered: bool
     primary_key: tuple[str, ...] | None
     columns: tuple[TableColumn, ...]
+    # Chronos-managed indexes on a registered table, ordered by name.
+    indexes: tuple[IndexInfo, ...] = ()
 
 
 @dataclass(frozen=True)

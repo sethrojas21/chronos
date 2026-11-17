@@ -466,6 +466,7 @@ class TestWorkspaceCommands:
         expected = {
             "table": "skill", "exists": True, "registered": True, "primary_key": ["key"],
             "columns": [{"name": "key", "type": "TEXT"}, {"name": "n", "type": "INTEGER"}],
+            "indexes": [],
         }
         result = runner.invoke(app, ["table", "info", "skill", "--store", "app"])
         assert result.exit_code == 0, result.output

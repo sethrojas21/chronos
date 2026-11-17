@@ -86,6 +86,14 @@ def register_table(ctx: typer.Context, table: str, store: str = typer.Option(...
         print_result(operations.register_table(workspace, store, table, primary_key))
 
 
+@table_app.command("index")
+def create_index(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store"),
+                 column: list[str] = typer.Option(..., "--column"),
+                 name: str | None = typer.Option(None, "--name")) -> None:
+    with connect_workspace(ctx, store) as workspace:
+        print_result(operations.create_index(workspace, store, table, column, name))
+
+
 @table_app.command("info")
 def table_info(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store")) -> None:
     with connect_workspace(ctx, store) as workspace:
