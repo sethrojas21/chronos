@@ -1,4 +1,5 @@
 #include "chronos/gateway/control_server.hpp"
+#include "chronos/gateway/python_control.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -124,6 +125,27 @@ std::string decode_path_component(const std::string &value) {
     return decoded;
 }
 
+// key=value pairs of a URL query; '+' is a space and later keys win.
+Json query_arguments(const std::string &query) {
+    Json result = Json::object();
+    std::size_t start = 0;
+    while (start <= query.size()) {
+        auto end = query.find('&', start);
+        if (end == std::string::npos) end = query.size();
+        std::string item = query.substr(start, end - start);
+        for (auto &character : item) if (character == '+') character = ' ';
+        const auto separator = item.find('=');
+        const auto key = decode_path_component(item.substr(0, separator));
+        if (!key.empty()) {
+            result[key] = separator == std::string::npos
+                ? std::string()
+                : decode_path_component(item.substr(separator + 1));
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
 std::vector<std::string> path_parts(const std::string &target) {
     std::vector<std::string> parts;
     std::size_t start = 0;
@@ -149,12 +171,14 @@ class ControlServer::Impl {
         ListenAddress listen,
         ListenAddress postgres,
         ListenAddress nfs,
-        std::string token)
+        std::string token,
+        const std::unordered_map<std::string, WorkspaceConfig> &workspaces)
         : runtime(runtime),
           listen(std::move(listen)),
           postgres(std::move(postgres)),
           nfs(std::move(nfs)),
           token(std::move(token)),
+          python(workspaces),
           acceptor(io) {}
 
     ~Impl() { stop(); join_clients(); }
@@ -231,7 +255,15 @@ class ControlServer::Impl {
             return json_response(http::status::unauthorized, {{"error", "unauthorized"}});
         }
         try {
-            const auto parts = path_parts(std::string(request.target()));
+            std::string target(request.target());
+            std::string query;
+            const auto query_start = target.find('?');
+            if (query_start != std::string::npos) {
+                query = target.substr(query_start + 1);
+                target.resize(query_start);
+            }
+            const auto parts = path_parts(target);
+            if (auto routed = versioning(parts, request, query)) return std::move(*routed);
             if (parts.size() == 4 && parts[0] == "v1" && parts[1] == "workspaces" &&
                 parts[3] == "branches" && request.method() == http::verb::post) {
                 return create(parts[2], request);
@@ -258,6 +290,61 @@ class ControlServer::Impl {
         } catch (const std::exception &error) {
             return json_response(http::status::bad_request, {{"error", error.what()}});
         }
+    }
+
+    // Versioning routes: each maps to one function of
+    // chronos_core.control.operations, run in the embedded interpreter.
+    std::optional<http::response<http::string_body>> versioning(
+        const std::vector<std::string> &parts,
+        const http::request<http::string_body> &request,
+        const std::string &query) {
+        if (parts.size() < 4 || parts[0] != "v1" || parts[1] != "workspaces") return std::nullopt;
+        const auto method = request.method();
+        const auto &resource = parts[3];
+        std::string operation;
+        Json path = Json::object();
+        if (resource == "branches" && parts.size() == 4 && method == http::verb::get) {
+            operation = "list_branches";
+        } else if (resource == "branches" && parts.size() == 6 && parts[5] == "metadata" &&
+                   method == http::verb::put) {
+            operation = "update_branch_metadata";
+            path["branch"] = parts[4];
+        } else if (resource == "checkpoints" && parts.size() == 4 && method == http::verb::post) {
+            operation = "create_checkpoint";
+        } else if (resource == "checkpoints" && parts.size() == 4 && method == http::verb::get) {
+            operation = "list_checkpoints";
+        } else if (resource == "diff" && parts.size() == 4 && method == http::verb::get) {
+            operation = "diff";
+        } else if (resource == "merges" && parts.size() == 5 && method == http::verb::post) {
+            if (parts[4] == "preview") operation = "merge_preview";
+            else if (parts[4] == "apply") operation = "merge_apply";
+            else if (parts[4] == "atomic-preview") operation = "merge_atomic_preview";
+            else if (parts[4] == "atomic-apply") operation = "merge_atomic";
+            else return std::nullopt;
+        } else if (resource == "tables" && parts.size() == 4 && method == http::verb::post) {
+            operation = "register_table";
+        } else if (resource == "tables" && parts.size() == 5 && method == http::verb::get) {
+            operation = "table_info";
+            path["table"] = parts[4];
+        } else if (resource == "tables" && parts.size() == 6 && parts[5] == "indexes" &&
+                   method == http::verb::post) {
+            operation = "create_index";
+            path["table"] = parts[4];
+        } else {
+            return std::nullopt;
+        }
+        // Arguments come from the JSON body, then the query, then the path.
+        Json arguments = request.body().empty() ? Json::object() : Json::parse(request.body());
+        if (!arguments.is_object()) throw GatewayError("request body must be a JSON object");
+        arguments.update(query_arguments(query));
+        arguments.update(path);
+        const auto result = python.call(parts[2], operation, arguments.dump());
+        http::response<http::string_body> response(static_cast<http::status>(result.status), 11);
+        response.set(http::field::content_type, "application/json");
+        response.set(http::field::cache_control, "no-store");
+        response.body() = result.body;
+        response.prepare_payload();
+        return response;
     }
 
     http::response<http::string_body> create(
@@ -394,6 +481,7 @@ class ControlServer::Impl {
     ListenAddress postgres;
     ListenAddress nfs;
     std::string token;
+    PythonControl python;
     asio::io_context io;
     tcp::acceptor acceptor;
     std::atomic<bool> stopping{false};
@@ -407,13 +495,15 @@ ControlServer::ControlServer(
     ListenAddress listen,
     ListenAddress postgres,
     ListenAddress nfs,
-    std::string controller_token)
+    std::string controller_token,
+    const std::unordered_map<std::string, WorkspaceConfig> &workspaces)
     : impl_(std::make_unique<Impl>(
           runtime,
           std::move(listen),
           std::move(postgres),
           std::move(nfs),
-          std::move(controller_token))) {}
+          std::move(controller_token),
+          workspaces)) {}
 
 ControlServer::~ControlServer() = default;
 void ControlServer::run() { impl_->run(); }

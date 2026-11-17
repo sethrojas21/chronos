@@ -84,6 +84,80 @@ http::response<http::string_body> request(
     throw std::runtime_error("control server did not accept connections");
 }
 
+Json body_of(const http::response<http::string_body> &response) {
+    return Json::parse(response.body());
+}
+
+// Versioning routes run chronos_core.control.gateway in the embedded
+// interpreter. Without the chronos_core package they answer 501, which is
+// accepted unless CHRONOS_GATEWAY_REQUIRE_PYTHON_CONTROL is set (Docker runs).
+void check_versioning_routes(std::uint16_t port) {
+    const std::string base = "/v1/workspaces/training";
+    auto listed = request(port, http::verb::get, base + "/branches");
+    if (listed.result() == http::status::not_implemented) {
+        check(std::getenv("CHRONOS_GATEWAY_REQUIRE_PYTHON_CONTROL") == nullptr,
+              "Python control must be available: " + listed.body());
+        check(body_of(listed).at("error").get<std::string>().find("Python control is unavailable") == 0,
+              "501 must explain that Python control is unavailable");
+        std::cout << "SKIP versioning routes: " << listed.body() << '\n';
+        return;
+    }
+    check(request(port, http::verb::get, base + "/branches", Json{}, "wrong").result() ==
+              http::status::unauthorized,
+          "versioning routes require bearer auth");
+    check(request(port, http::verb::get, "/v1/workspaces/missing/branches").result() ==
+              http::status::not_found,
+          "an unknown workspace is not found");
+    // Query, path, and body arguments reach the Python operation.
+    auto diff = request(port, http::verb::get, base + "/diff?left=main");
+    check(diff.result() == http::status::bad_request &&
+              body_of(diff).at("error") == "right is required",
+          "diff takes left and right from the query: " + diff.body());
+    auto table = request(port, http::verb::get, base + "/tables/orders?store=missing+store");
+    check(table.result() == http::status::not_found &&
+              body_of(table).at("error") == "unknown store 'missing store'",
+          "table info takes its store from the query: " + table.body());
+    auto metadata = request(port, http::verb::put, base + "/branches/main/metadata",
+                            {{"store", "orders"}, {"metadata", {{"a", 1}}}, {"extra", true}});
+    check(metadata.result() == http::status::bad_request &&
+              body_of(metadata).at("error") == "unexpected arguments: extra",
+          "metadata update passes body arguments: " + metadata.body());
+    auto index = request(port, http::verb::post, base + "/tables/orders/indexes",
+                         {{"store", "orders"}});
+    check(index.result() == http::status::bad_request &&
+              body_of(index).at("error") == "columns must be a non-empty array of names",
+          "index creation takes the table from the path: " + index.body());
+    auto merge = request(port, http::verb::post, base + "/merges/atomic-apply",
+                         {{"source", "a"}, {"target", "main"}});
+    check(merge.result() == http::status::bad_request &&
+              body_of(merge).at("error") == "operation_id is required",
+          "atomic apply requires an operation id: " + merge.body());
+    check(request(port, http::verb::post, base + "/merges/sideways", {{"source", "a"}}).result() ==
+              http::status::not_found,
+          "unknown merge routes are not found");
+    check(request(port, http::verb::post, base + "/checkpoints", Json::array({1})).result() ==
+              http::status::bad_request,
+          "a request body must be a JSON object");
+    // This workspace has a SQL store and ChronosFS on one metadata plane, so
+    // diff and merges need merge_tables, as in the CLI.
+    auto unscoped = request(port, http::verb::get, base + "/diff?left=main&right=agent");
+    check(unscoped.result() == http::status::bad_request &&
+              body_of(unscoped).at("error").get<std::string>().find("merge_tables") != std::string::npos,
+          "diff needs merge scope for several stores: " + unscoped.body());
+    // Operations that open the workspace. The gateway's stores keep metadata
+    // in a separate database; until the Python API opens such stores with
+    // branch-local schema, it reports that instead of serving the request.
+    if (listed.result() == http::status::ok) {
+        check(listed.body().find("\"main\"") != std::string::npos,
+              "branch list must include main: " + listed.body());
+    } else {
+        check(listed.result() == http::status::bad_request &&
+                  listed.body().find("split metadata/data") != std::string::npos,
+              "branch list must succeed or report the split-store limitation: " + listed.body());
+        std::cout << "NOTE branch list: " << listed.body() << '\n';
+    }
+}
+
 } // namespace
 
 int main() {
@@ -113,7 +187,8 @@ int main() {
         ListenAddress{"127.0.0.1", port},
         ListenAddress{"127.0.0.1", 15432},
         ListenAddress{"127.0.0.1", 12049},
-        "controller-test");
+        "controller-test",
+        {{"training", workspace}});
     std::thread server_thread([&] { server.run(); });
 
     auto health = request(port, http::verb::get, "/healthz", Json{}, "");
@@ -194,6 +269,12 @@ int main() {
           "DELETE must delete a long-lived branch");
     check(request(port, http::verb::get, agent_path).result() == http::status::not_found,
           "a deleted long-lived branch must be gone");
+
+    // A query string does not change an existing route.
+    check(request(port, http::verb::get, branch_path + "?verbose=1").result() == http::status::ok,
+          "existing routes must ignore the query string");
+
+    check_versioning_routes(port);
 
     server.stop();
     server_thread.join();

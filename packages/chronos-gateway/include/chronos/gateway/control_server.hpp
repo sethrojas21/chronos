@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace chronos::gateway {
 
@@ -16,7 +17,9 @@ class ControlServer {
         ListenAddress listen,
         ListenAddress postgres,
         ListenAddress nfs,
-        std::string controller_token);
+        std::string controller_token,
+        // Workspaces served by the versioning routes (see python_control.hpp).
+        const std::unordered_map<std::string, WorkspaceConfig> &workspaces = {});
     ~ControlServer();
     ControlServer(const ControlServer &) = delete;
     ControlServer &operator=(const ControlServer &) = delete;

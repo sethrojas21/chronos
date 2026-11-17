@@ -60,7 +60,8 @@ int main(int argc, char **argv) {
                 config.control,
                 config.postgres_advertised.host.empty() ? config.postgres : config.postgres_advertised,
                 config.nfs,
-                config.controller_token);
+                config.controller_token,
+                config.workspaces);
             chronos::gateway::PostgresServer postgres_server(runtime, config.postgres);
             std::optional<chronos::gateway::NfsServer> nfs_server;
             if (config.nfs_enabled) nfs_server.emplace(runtime, config.nfs, config.nfs_runtime);

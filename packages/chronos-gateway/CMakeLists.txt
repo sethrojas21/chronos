@@ -42,6 +42,7 @@ if(CHRONOS_GATEWAY_WITH_CHRONOS)
       src/runtime.cpp
       src/config.cpp
       src/control_server.cpp
+      src/python_control.cpp
       src/postgres_server.cpp
       src/filesystem_view.cpp
       src/fuse_server.cpp
