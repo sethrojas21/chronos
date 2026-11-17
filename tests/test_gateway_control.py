@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -182,3 +183,53 @@ def test_split_metadata_store_as_the_gateway_configures_it(tmp_path: Path) -> No
         assert _call(control, "list_branches") == (200, ["main"])
     finally:
         control.close()
+
+
+def _shared_control(tmp_path: Path) -> GatewayControl:
+    entry = {"data_url": f"sqlite:///{tmp_path / 'shared.sqlite'}"}
+    workspace = {"schema_branching": False, "stores": {"app": entry}}
+    return GatewayControl(json.dumps({"workspaces": {"shared": workspace}}))
+
+
+def test_shared_structure_ddl_creates_and_registers_for_every_branch(tmp_path: Path) -> None:
+    control = _shared_control(tmp_path)
+    try:
+        ddl = partial(_call, control, "apply_ddl", workspace="shared", store="app")
+        create = 'CREATE TABLE IF NOT EXISTS "hb_note" ("objectId" TEXT NOT NULL, name TEXT, PRIMARY KEY ("objectId"))'
+        assert ddl(sql=create) == (200, {"tag": "CREATE TABLE", "created": True})
+        assert ddl(sql=create) == (200, {"tag": "CREATE TABLE", "created": False})
+        status, body = ddl(sql='CREATE TABLE "hb_note" ("objectId" TEXT PRIMARY KEY)')
+        assert status == 400 and body["sqlstate"] == "42P07"
+        # A partial index becomes a plain index on the same columns.
+        index = 'CREATE INDEX IF NOT EXISTS hb_note_name ON "hb_note" (name) WHERE name IS NOT NULL'
+        assert ddl(sql=index) == (200, {"tag": "CREATE INDEX", "created": True})
+        assert ddl(sql=index) == (200, {"tag": "CREATE INDEX", "created": False})
+        status, info = _call(control, "table_info", workspace="shared", store="app", table="hb_note")
+        assert status == 200 and info["registered"] and info["primary_key"] == ["objectId"]
+        assert [(item["name"], item["columns"]) for item in info["indexes"]] == [("hb_note_name", ["name"])]
+
+        # The table exists on every branch, including ones created before it.
+        workspace = control._open(control._workspaces["shared"])
+        workspace.create_branch("agent")
+        workspace.stores["app"].checkout("agent").execute(
+            "INSERT INTO hb_note (\"objectId\", name) VALUES ('n1', 'note')")
+        assert workspace.stores["app"].checkout("main").query("SELECT name FROM hb_note") == []
+        assert workspace.stores["app"].checkout("agent").query("SELECT name FROM hb_note") == [{"name": "note"}]
+
+        for sql, sqlstate in [
+            ("CREATE TABLE keyless (id TEXT)", "0A000"),
+            ("CREATE UNIQUE INDEX u ON hb_note (name)", "0A000"),
+            ("CREATE INDEX ON hb_note (lower(name))", "0A000"),
+            ("CREATE INDEX ON missing (id)", "42P01"),
+            ("DROP TABLE hb_note", "0A000"),
+            ("CREATE TABLE other.t (id TEXT PRIMARY KEY)", "0A000"),
+        ]:
+            status, body = ddl(sql=sql)
+            assert status == 400 and body["sqlstate"] == sqlstate, (sql, body)
+    finally:
+        control.close()
+
+
+def test_apply_ddl_is_refused_with_branch_local_schema(control: GatewayControl) -> None:
+    status, body = _call(control, "apply_ddl", store="app", sql="CREATE TABLE t (id TEXT PRIMARY KEY)")
+    assert status == 400 and "shared table structure" in body["error"]

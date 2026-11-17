@@ -207,6 +207,13 @@ def _table_info(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     return lambda ws: operations.table_info(ws, store, table)
 
 
+def _apply_ddl(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
+    from chronos_core.control.ddl import apply_shared_ddl
+
+    store, sql = _store(c, a), _text(a, "sql")
+    return lambda ws: apply_shared_ddl(ws, store, sql)
+
+
 def _create_index(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     store, table, columns = _store(c, a), _text(a, "table"), _names(a, "columns")
     name = _text(a, "name", required=False)
@@ -228,6 +235,8 @@ _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[st
     "register_table": (_register_table, frozenset({"store", "table", "primary_key", "create_sql"}), 201, False),
     "table_info": (_table_info, frozenset({"store", "table"}), 200, False),
     "create_index": (_create_index, frozenset({"store", "table", "columns", "name"}), 201, False),
+    # CREATE TABLE / CREATE INDEX from SQL clients of a shared-structure workspace.
+    "apply_ddl": (_apply_ddl, frozenset({"store", "sql"}), 200, False),
 }
 
 
@@ -288,6 +297,8 @@ class GatewayControl:
             unexpected = sorted(set(args) - accepted)
             if unexpected:
                 raise ControlError(400, f"unexpected arguments: {', '.join(unexpected)}")
+            if request.get("operation") == "apply_ddl" and entry.schema_branching:
+                raise ControlError(400, "apply_ddl is only for workspaces with shared table structure")
             run = handler(entry.config, args)
             if needs_scope and not entry.merge_scoped:
                 raise ControlError(
@@ -303,7 +314,11 @@ class GatewayControl:
             message = redact_message(str(error), urls=urls) or type(error).__name__
             if status >= 500:
                 print(f"chronos-gateway control: {type(error).__name__}: {message}", file=sys.stderr, flush=True)
-            return json.dumps({"status": status, "body": {"error": message}})
+            body: dict[str, Any] = {"error": message}
+            sqlstate = getattr(error, "sqlstate", None)
+            if isinstance(sqlstate, str):
+                body["sqlstate"] = sqlstate  # for SQL clients of the gateway
+            return json.dumps({"status": status, "body": body})
 
     @staticmethod
     def _open(entry: _Workspace) -> ChronosWorkspaceContext:
