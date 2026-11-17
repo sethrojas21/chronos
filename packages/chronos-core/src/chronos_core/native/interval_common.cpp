@@ -247,11 +247,15 @@ struct NativeRowKeyHash {
     }
 };
 
-// type_oid is the column's PostgreSQL type OID as the store reports it, or 0
-// when unknown. Text is decoded as JSON only for json/jsonb columns; a column
-// of any other known type (such as TEXT) keeps its exact text. Unknown types
-// keep the older heuristic of decoding text that starts with '{' or '['.
-py::object value_to_py(const Value &value, std::uint32_t type_oid = 0) {
+// A result path that carries no column types at all.
+constexpr std::uint32_t kUntypedColumn = 0xffffffffU;
+
+// type_oid is the column's PostgreSQL type OID as the store reports it (0 when
+// the store reports no type, as SQLite does for expressions). Text is decoded
+// as JSON only for json/jsonb columns; everything else keeps its exact text.
+// Only paths with no column types (kUntypedColumn) keep the older heuristic of
+// decoding text that starts with '{' or '['.
+py::object value_to_py(const Value &value, std::uint32_t type_oid = kUntypedColumn) {
     if (std::holds_alternative<std::monostate>(value)) {
         return py::none();
     }
@@ -264,7 +268,7 @@ py::object value_to_py(const Value &value, std::uint32_t type_oid = 0) {
     if (auto ptr = std::get_if<std::string>(&value)) {
         const bool json_column = type_oid == 114 || type_oid == 3802;
         const bool json_looking = !ptr->empty() && ((*ptr)[0] == '{' || (*ptr)[0] == '[');
-        if (json_column || (type_oid == 0 && json_looking)) {
+        if (json_column || (type_oid == kUntypedColumn && json_looking)) {
             try {
                 return py::module_::import("json").attr("loads")(*ptr);
             } catch (...) {

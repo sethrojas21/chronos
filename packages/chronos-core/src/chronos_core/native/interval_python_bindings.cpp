@@ -1033,7 +1033,7 @@ void bind_interval_data_plane(py::module_ &m) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
                         item[result.columns[i].c_str()] = value_to_py(
-                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
+                            row[i], i < result.column_types.size() ? result.column_types[i] : kUntypedColumn);
                     }
                     out.append(item);
                 }
@@ -1056,7 +1056,7 @@ void bind_interval_data_plane(py::module_ &m) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
                         item[result.columns[i].c_str()] = value_to_py(
-                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
+                            row[i], i < result.column_types.size() ? result.column_types[i] : kUntypedColumn);
                     }
                     out.append(item);
                 }
@@ -1574,7 +1574,7 @@ void bind_interval_data_plane(py::module_ &m) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
                         item[result.columns[i].c_str()] = value_to_py(
-                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
+                            row[i], i < result.column_types.size() ? result.column_types[i] : kUntypedColumn);
                     }
                     out.append(item);
                 }
@@ -1635,7 +1635,7 @@ void bind_interval_data_plane(py::module_ &m) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
                         item[result.columns[i].c_str()] = value_to_py(
-                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
+                            row[i], i < result.column_types.size() ? result.column_types[i] : kUntypedColumn);
                     }
                     out.append(item);
                 }

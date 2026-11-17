@@ -606,8 +606,12 @@ class TestWorkspaceSQLWorkflows:
         invoke("table", "register", "--store", "app", "seq", "--primary-key", "key")
         stored = {"a": '{"name":"writes","value":1}', "b": "[1,2]", "c": "123", "d": "true", "e": "null"}
         invoke("upsert", "seq", json.dumps([{"key": k, "value": v} for k, v in stored.items()]), "--store", "app")
-        rows = invoke("query", "SELECT key, value FROM seq ORDER BY key", "--store", "app")
+        rows = invoke("query", "SELECT key, value, CAST(value AS TEXT) AS cast_value, "
+                      "COALESCE(value, '') AS coalesced FROM seq ORDER BY key", "--store", "app")
         assert {row["key"]: row["value"] for row in rows} == stored
+        # Expressions have no declared type on SQLite; their text stays text too.
+        assert {row["key"]: row["cast_value"] for row in rows} == stored
+        assert {row["key"]: row["coalesced"] for row in rows} == stored
 
     def test_table_info(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
