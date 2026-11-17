@@ -656,11 +656,14 @@ class TestWorkspaceSQLWorkflows:
 
         # Reads inside the transaction see its writes; rollback discards them.
         invoke("begin", *on_agent)
-        invoke("table", "info", "skill", "--store", "app", ok=False)
         invoke("table", "index", "skill", "--store", "app", "--column", "body", ok=False)
         invoke("query", "SELECT 1 AS one", "--store", "app", ok=False)  # branch main, not the open one
         invoke("execute", "INSERT INTO skill (key, body) VALUES ('a', 'x')", *on_agent)
         invoke("upsert", "skill", '[{"key": "b", "body": "y"}]', *on_agent)
+        # Reading table info after writes neither fails nor ends the transaction.
+        assert invoke("table", "info", "skill", "--store", "app")["primary_key"] == ["key"]
+        invoke("table", "create", "--store", "app", "CREATE TABLE other (id INTEGER PRIMARY KEY)", ok=False)
+        invoke("table", "register", "--store", "app", "skill", "--primary-key", "key", ok=False)
         assert invoke("query", keys, *on_agent) == [{"key": "a"}, {"key": "b"}]
         invoke("rollback")
         assert invoke("query", keys, *on_agent) == []

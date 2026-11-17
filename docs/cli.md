@@ -282,13 +282,15 @@ printf '%s\n' \
   chronos --persistent
 ```
 
-Check and prepare tables (`table info`, `table create`, `table register`)
-before `begin`: table commands are refused inside a transaction, and table
-creation commits on the store's connection.
+Prepare tables (`table create`, `table register`, `table index`) before
+`begin`: they are refused inside a transaction, because they commit on their
+own and, with SQLite, need the write lock the transaction holds. `table info`
+only reads and is allowed inside a transaction.
 
 - While a transaction is open, every other command is refused with exit code 1,
   including `query`/`execute`/`upsert` on another store or branch, `begin`,
-  `transaction`, and branch, checkpoint, merge, and table commands. A refused
+  `transaction`, and branch, checkpoint, merge, and table commands other than
+  `table info`. A refused
   command does not affect the transaction.
 - If a command inside the transaction fails, only `rollback` is accepted;
   everything else, including `commit`, is refused until then.

@@ -75,7 +75,8 @@ class _Rollback(Exception):
 
 
 # Commands allowed while a transaction is open; only rollback once it has failed.
-_IN_TRANSACTION = {("query",), ("execute",), ("upsert",), ("commit",), ("rollback",)}
+# `table info` only reads the registries, so it cannot disturb the open transaction.
+_IN_TRANSACTION = {("query",), ("execute",), ("upsert",), ("commit",), ("rollback",), ("table", "info")}
 _transaction: _OpenTransaction | None = None
 
 
