@@ -90,7 +90,14 @@ travel as `t`/`f`. With PostgreSQL stores the types are the server's own. With
 SQLite stores they follow each column's declared type, and computed
 expressions are typed from their values. Describing a bound portal reports
 these types (node-postgres and `PQexecPrepared` use this path). Describing a
-prepared statement before binding still reports no columns.
+prepared statement before binding (postgres.js uses this path) reports its
+columns and parameter types: the gateway prepares the rewritten query on the
+store without running it. On SQLite, parameters and computed columns are
+described as unknown or text.
+
+A refused or failing statement inside a transaction leaves the transaction
+failed until `ROLLBACK` (or `COMMIT`, which rolls back), through either the
+simple or the extended protocol, as in PostgreSQL.
 
 The test suite includes an opt-in end-to-end test against E2B Embed running on
 the same machine. It creates real Firecracker microVMs and exercises both the

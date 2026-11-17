@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 #include <libpq-fe.h>
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -12,6 +13,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 using chronos::gateway::CreateBranchRequest;
@@ -449,6 +453,14 @@ int main() {
         check(PQresultStatus(executed.get()) == PGRES_TUPLES_OK, PQerrorMessage(connection.get()));
         check(PQftype(executed.get(), 0) == 16, "portal Describe must report column types");
         check(std::string(PQgetvalue(executed.get(), 0, 0)) == "t", "prepared booleans must travel as t/f");
+        // Describing the statement before binding, as postgres.js does,
+        // reports its columns and parameter types without running it.
+        Result described(PQdescribePrepared(connection.get(), "typed_lookup"));
+        check(PQresultStatus(described.get()) == PGRES_COMMAND_OK, PQerrorMessage(connection.get()));
+        check(PQnfields(described.get()) == 1 && std::string(PQfname(described.get(), 0)) == "active" &&
+                  PQftype(described.get(), 0) == 16,
+              "statement Describe must report result columns and types");
+        check(PQnparams(described.get()) == 1, "statement Describe must report the parameter count");
     }
 
     // Common CREATE TABLE forms: NOT NULL, COLLATE, a table-level PRIMARY KEY
@@ -557,6 +569,26 @@ int main() {
           "ROLLBACK must restore idle transaction state");
     expect_cell(connection.get(), "SELECT state FROM orders WHERE id = 1",
                 0, 0, "placed", "connection must work after failed-transaction recovery");
+    // The same recovery through the extended protocol, as postgres.js sends
+    // ROLLBACK, including after a statement the gateway refuses.
+    expect_command(connection.get(), "BEGIN", "BEGIN", "an extended-protocol recovery must begin");
+    check(PQresultStatus(execute(connection.get(), "CREATE SCHEMA IF NOT EXISTS probe").get()) ==
+              PGRES_FATAL_ERROR && PQtransactionStatus(connection.get()) == PQTRANS_INERROR,
+          "a refused statement inside a transaction must fail the transaction");
+    {
+        Result blocked_extended(PQexecParams(connection.get(), "SELECT state FROM orders WHERE id = $1",
+                                             1, nullptr, std::array<const char *, 1>{"1"}.data(),
+                                             nullptr, nullptr, 0));
+        const char *state = PQresultErrorField(blocked_extended.get(), PG_DIAG_SQLSTATE);
+        check(state && std::string(state) == "25P02",
+              "extended queries in a failed transaction must be rejected with SQLSTATE 25P02");
+        Result rolled_back(PQexecParams(connection.get(), "ROLLBACK", 0, nullptr, nullptr, nullptr, nullptr, 0));
+        check(PQresultStatus(rolled_back.get()) == PGRES_COMMAND_OK &&
+                  PQtransactionStatus(connection.get()) == PQTRANS_IDLE,
+              "an extended-protocol ROLLBACK must recover a failed transaction");
+    }
+    expect_cell(connection.get(), "SELECT state FROM orders WHERE id = 1",
+                0, 0, "placed", "connection must work after extended-protocol recovery");
     expect_command(connection.get(), "BEGIN", "BEGIN",
                    "a committing transaction must begin");
     expect_command(connection.get(),
@@ -570,6 +602,22 @@ int main() {
                 0, 0, "committed", "committed data must remain visible");
     expect_command(connection.get(), "DELETE FROM orders WHERE id = 6",
                    "DELETE 1", "committed test data must be removable");
+
+    {
+        // Terminate closes the connection, so clients waiting for it finish.
+        auto closing = connect(port, issued.access_grant->id, issued.database_credential, "orders");
+        check(PQstatus(closing.get()) == CONNECTION_OK, PQerrorMessage(closing.get()));
+        const int descriptor = dup(PQsocket(closing.get()));
+        closing.reset();
+        // libpq's socket is non-blocking; wait for the close instead.
+        fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) & ~O_NONBLOCK);
+        char byte = 0;
+        timeval timeout{2, 0};
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        const auto received = recv(descriptor, &byte, 1, 0);
+        close(descriptor);
+        check(received == 0, "the gateway must close a connection after Terminate");
+    }
 
     auto bad = connect(port, issued.access_grant->id, "wrong", "orders");
     check(PQstatus(bad.get()) == CONNECTION_BAD, "wrong grant secret must fail authentication");

@@ -10,6 +10,8 @@
 #include <iomanip>
 #include <iterator>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -262,6 +264,53 @@ void send_result(tcp::socket &socket, const IntervalQueryResult &result) {
     send_data_rows(socket, result);
 }
 
+// An error carrying its PostgreSQL SQLSTATE.
+class SqlStateError : public std::runtime_error {
+  public:
+    SqlStateError(const std::string &message, std::string code)
+        : std::runtime_error(message), code(std::move(code)) {}
+    std::string code;
+};
+
+struct PreparedStatement {
+    std::string sql;
+    // Parameter types the client declared in Parse; 0 where unspecified.
+    std::vector<std::uint32_t> parameter_types;
+};
+
+// Answers Describe for a statement before it is bound, as clients such as
+// postgres.js require: they read the result columns from this answer and
+// reuse them for every later execution.
+void send_statement_description(tcp::socket &socket, SqlBranchSession &branch_session,
+                                const PreparedStatement &statement) {
+    const auto keyword = lower_keyword(statement.sql);
+    std::vector<std::uint32_t> parameter_types = statement.parameter_types;
+    std::optional<IntervalQueryResult> columns;
+    if (keyword == "select" || keyword == "with") {
+        enforce_branch_sql_boundary(statement.sql);
+        auto description = branch_session.session().describe(statement.sql);
+        if (parameter_types.size() < description.parameter_types.size()) {
+            parameter_types.resize(description.parameter_types.size(), 0);
+        }
+        for (std::size_t index = 0; index < description.parameter_types.size(); ++index) {
+            if (parameter_types[index] == 0) parameter_types[index] = description.parameter_types[index];
+        }
+        columns.emplace();
+        columns->columns = std::move(description.columns);
+        columns->column_types = std::move(description.column_types);
+    } else if (keyword == "show") {
+        columns.emplace();
+        columns->columns = {"setting"};
+        columns->column_types = {kTextOid};
+    }
+    std::string payload;
+    append_u16(payload, static_cast<std::uint16_t>(parameter_types.size()));
+    for (const auto type : parameter_types) append_u32(payload, type);
+    send_message(socket, 't', payload);
+    if (columns) send_row_description(socket, *columns);
+    else send_message(socket, 'n', {});
+}
+
 struct Portal {
     std::string sql;
     std::vector<IntervalValue> params;
@@ -355,8 +404,9 @@ class PostgresServer::Impl {
                 throw boost::system::system_error(error);
             }
             std::lock_guard lock(clients_mutex);
+            reap_finished_clients();
             sockets.push_back(socket);
-            clients.emplace_back([this, socket] { serve(socket); });
+            clients.emplace_back([this, socket] { serve(socket); finish_client(socket); });
         }
         join_clients();
     }
@@ -374,11 +424,35 @@ class PostgresServer::Impl {
     }
 
   private:
+    // Closes a finished connection so the client sees its end (a pg client
+    // waits for the close after Terminate), and lets its thread be reaped.
+    void finish_client(const std::shared_ptr<tcp::socket> &socket) {
+        std::lock_guard lock(clients_mutex);
+        boost::system::error_code ignored;
+        socket->shutdown(tcp::socket::shutdown_both, ignored);
+        socket->close(ignored);
+        sockets.erase(std::remove(sockets.begin(), sockets.end(), socket), sockets.end());
+        finished.push_back(std::this_thread::get_id());
+    }
+
+    // Joins threads whose connections have finished; called under clients_mutex.
+    void reap_finished_clients() {
+        if (finished.empty()) return;
+        for (auto client = clients.begin(); client != clients.end();) {
+            const auto done = std::find(finished.begin(), finished.end(), client->get_id());
+            if (done == finished.end()) { ++client; continue; }
+            finished.erase(done);
+            if (client->joinable()) client->join();
+            client = clients.erase(client);
+        }
+    }
+
     void join_clients() {
         std::vector<std::thread> pending;
         {
             std::lock_guard lock(clients_mutex);
             pending.swap(clients);
+            finished.clear();
             sockets.clear();
         }
         for (auto &thread : pending) if (thread.joinable()) thread.join();
@@ -432,10 +506,23 @@ class PostgresServer::Impl {
             send_message(socket, 'K', key);
             send_ready(socket, 'I');
 
-            std::unordered_map<std::string, std::string> statements;
+            std::unordered_map<std::string, PreparedStatement> statements;
             std::unordered_map<std::string, Portal> portals;
             bool failed_transaction = false;
             bool ignore_until_sync = false;
+            // PostgreSQL accepts only the end of a failed transaction block.
+            // Returns the reply for COMMIT/END, which roll it back.
+            auto failed_transaction_reply = [&](const std::string &keyword) -> std::optional<Execution> {
+                if (!failed_transaction || keyword == "rollback") return std::nullopt;
+                if (keyword == "commit" || keyword == "end") {
+                    branch_session->session().rollback();
+                    failed_transaction = false;
+                    return Execution{false, {}, "ROLLBACK"};
+                }
+                throw SqlStateError(
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                    "25P02");
+            };
             while (!stopping.load()) {
                 read_exact(socket, &type, 1);
                 auto payload = read_sized_payload(socket);
@@ -448,31 +535,25 @@ class PostgresServer::Impl {
                     if (type == 'Q') {
                         std::size_t offset = 0;
                         const auto sql = take_cstring(payload, offset);
-                        const auto keyword = lower_keyword(sql);
-                        if (failed_transaction && keyword != "rollback" &&
-                            keyword != "commit" && keyword != "end") {
-                            send_error(socket,
-                                "current transaction is aborted, commands ignored until end of transaction block",
-                                "25P02");
-                            send_ready(socket, 'E');
-                            continue;
-                        }
-                        if (failed_transaction && (keyword == "commit" || keyword == "end")) {
-                            branch_session->session().rollback();
-                            send_message(socket, 'C', std::string("ROLLBACK") + '\0');
-                            failed_transaction = false;
-                            send_ready(socket, 'I');
-                            continue;
-                        }
-                        auto execution = execute_sql(*branch_session, sql, {});
-                        send_execution(socket, execution, true);
+                        auto execution = failed_transaction_reply(lower_keyword(sql));
+                        if (!execution) execution = execute_sql(*branch_session, sql, {});
+                        send_execution(socket, *execution, true);
                         failed_transaction = false;
                         send_ready(socket, branch_session->session().in_transaction() ? 'T' : 'I');
                     } else if (type == 'P') {
                         std::size_t offset = 0;
                         auto name = take_cstring(payload, offset);
-                        auto sql = take_cstring(payload, offset);
-                        statements[std::move(name)] = std::move(sql);
+                        PreparedStatement statement{take_cstring(payload, offset), {}};
+                        if (offset + 2 <= payload.size()) {
+                            const auto count = read_u16(reinterpret_cast<const unsigned char *>(payload.data() + offset));
+                            offset += 2;
+                            for (std::uint16_t index = 0; index < count && offset + 4 <= payload.size(); ++index) {
+                                statement.parameter_types.push_back(
+                                    read_u32(reinterpret_cast<const unsigned char *>(payload.data() + offset)));
+                                offset += 4;
+                            }
+                        }
+                        statements[std::move(name)] = std::move(statement);
                         send_message(socket, '1', {});
                     } else if (type == 'B') {
                         std::size_t offset = 0;
@@ -487,7 +568,7 @@ class PostgresServer::Impl {
                         const auto count = read_u16(reinterpret_cast<const unsigned char *>(payload.data() + offset));
                         offset += 2;
                         Portal portal;
-                        portal.sql = found->second;
+                        portal.sql = found->second.sql;
                         for (std::uint16_t index = 0; index < count; ++index) {
                             if (offset + 4 > payload.size()) throw GatewayError("malformed bind parameter");
                             const auto length = read_u32(reinterpret_cast<const unsigned char *>(payload.data() + offset));
@@ -508,15 +589,14 @@ class PostgresServer::Impl {
                         if (payload[0] == 'S') {
                             auto found = statements.find(name);
                             if (found == statements.end()) throw GatewayError("unknown prepared statement");
-                            std::string parameter_description;
-                            append_u16(parameter_description, 0);
-                            send_message(socket, 't', parameter_description);
-                            send_message(socket, 'n', {});
+                            send_statement_description(socket, *branch_session, found->second);
                         } else if (payload[0] == 'P') {
                             auto found = portals.find(name);
                             if (found == portals.end()) throw GatewayError("unknown portal");
                             const auto keyword = lower_keyword(found->second.sql);
-                            if (keyword == "select" || keyword == "with" || keyword == "show") {
+                            // A failed transaction runs nothing; Execute reports the error.
+                            if (!failed_transaction &&
+                                (keyword == "select" || keyword == "with" || keyword == "show")) {
                                 auto execution = execute_sql(*branch_session, found->second.sql, found->second.params);
                                 found->second.described_result = std::move(execution.rows);
                                 send_row_description(socket, *found->second.described_result);
@@ -527,7 +607,9 @@ class PostgresServer::Impl {
                         const auto portal_name = take_cstring(payload, offset);
                         auto found = portals.find(portal_name);
                         if (found == portals.end()) throw GatewayError("unknown portal");
-                        if (found->second.described_result) {
+                        if (auto reply = failed_transaction_reply(lower_keyword(found->second.sql))) {
+                            send_execution(socket, *reply, false);
+                        } else if (found->second.described_result) {
                             Execution execution{true, std::move(*found->second.described_result), {}};
                             found->second.described_result.reset();
                             send_execution(socket, execution, false);
@@ -535,6 +617,8 @@ class PostgresServer::Impl {
                             send_execution(socket, execute_sql(
                                 *branch_session, found->second.sql, found->second.params), false);
                         }
+                        // Only ROLLBACK can succeed in a failed transaction.
+                        failed_transaction = false;
                     } else if (type == 'C') {
                         if (payload.empty()) throw GatewayError("malformed close message");
                         std::size_t offset = 1;
@@ -553,7 +637,8 @@ class PostgresServer::Impl {
                     }
                 } catch (const std::exception &error) {
                     failed_transaction = branch_session->session().in_transaction();
-                    send_error(socket, error.what(), "0A000");
+                    const auto *coded = dynamic_cast<const SqlStateError *>(&error);
+                    send_error(socket, error.what(), coded ? coded->code : "0A000");
                     if (type == 'Q') send_ready(socket, failed_transaction ? 'E' : 'I');
                     else ignore_until_sync = true;
                 }
@@ -573,6 +658,7 @@ class PostgresServer::Impl {
     std::mutex clients_mutex;
     std::vector<std::shared_ptr<tcp::socket>> sockets;
     std::vector<std::thread> clients;
+    std::vector<std::thread::id> finished;
 };
 
 PostgresServer::PostgresServer(GatewayRuntime &runtime, ListenAddress listen)
