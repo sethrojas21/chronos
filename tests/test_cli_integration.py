@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 from psycopg import sql as postgres_sql
 
 from chronos_core import _native_interval
+from chronos_core.branching import TableNotRegisteredError
 from chronos_core.cli._config import DatabaseConfig, QdrantConfig, load_workspace_config
 from chronos_core.cli._config import open_workspace as _api_open_workspace
 
@@ -653,6 +654,12 @@ class TestWorkspaceSQLWorkflows:
                 assert store.describe_table("audit").registered is False
                 one_shot(["table", "register", "--store", "app", "audit", "--primary-key", "id"])
                 assert store.describe_table("audit").primary_key == ("id",)
+                # Writes through the already open context find the new table too.
+                session = store.checkout("main")
+                assert session.upsert_rows("audit", [{"id": 1}]).rowcount == 1
+                with pytest.raises(TableNotRegisteredError, match="'nowhere' is not registered"):
+                    session.upsert_rows("nowhere", [{"id": 1}])
+                session.close()
 
     def test_persistent_open_transactions(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)

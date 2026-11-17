@@ -1165,10 +1165,18 @@ class _SQLBranchBackend:
         return None
 
     def _require_table(self, table: str) -> _TableMeta:
-        try:
-            return self.tables[table]
-        except KeyError as exc:
-            raise TableNotRegisteredError(table) from exc
+        meta = self.tables.get(table)
+        if meta is None:
+            # Another process may have registered the table since this
+            # process read the registry. Reread only the table registry; it
+            # leaves native sessions and any open transaction untouched.
+            self.tables = _parse_table_registry(self.db, self.name)
+            meta = self.tables.get(table)
+        if meta is None:
+            raise TableNotRegisteredError(
+                f"table {table!r} is not registered with Chronos; register it with its primary key first"
+            )
+        return meta
 
     def _all_user_tables_replacements(self, replacement_for: Any) -> dict[str, str]:
         return {name: replacement_for(meta) for name, meta in self.tables.items()}
