@@ -46,6 +46,12 @@ struct IntervalQueryResult {
     std::vector<std::uint32_t> column_types;
 };
 
+struct IntervalStatementDescription {
+    std::vector<std::string> columns;
+    std::vector<std::uint32_t> column_types;
+    std::vector<std::uint32_t> parameter_types;
+};
+
 struct IntervalBulkUpsertStats {
     std::int64_t selected = 0;
     std::int64_t deleted_rows = 0;

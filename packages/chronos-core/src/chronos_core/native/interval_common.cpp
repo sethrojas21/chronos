@@ -43,6 +43,13 @@ struct QueryResult {
     std::vector<std::uint32_t> column_types;
 };
 
+// A query's result columns and parameters, known without running it.
+struct StatementDescription {
+    std::vector<std::string> columns;
+    std::vector<std::uint32_t> column_types;
+    std::vector<std::uint32_t> parameter_types;
+};
+
 struct NativeInsertPlan {
     std::string table;
     // The table's alias in INSERT INTO t AS alias, for qualified references.

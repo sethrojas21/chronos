@@ -549,6 +549,12 @@ IntervalQueryResult NativeBranchSession::explain(
     return {std::move(result.columns), std::move(result.rows), std::move(result.column_types)};
 }
 
+IntervalStatementDescription NativeBranchSession::describe(const std::string &sql) {
+    StatementDescription description = impl_->describe(sql);
+    return {std::move(description.columns), std::move(description.column_types),
+            std::move(description.parameter_types)};
+}
+
 std::string NativeBranchSession::rewrite_query(const std::string &sql) {
     return impl_->rewrite_query(sql);
 }

@@ -39,6 +39,13 @@ class NativeBranchSessionImpl {
         return store_.driver().query_result("EXPLAIN " + rewrite_select_sql(sql), params);
     }
 
+    StatementDescription describe(const std::string &sql) {
+        if (!is_select_query_sql(sql)) {
+            throw std::runtime_error("native branch describe only accepts SELECT");
+        }
+        return store_.driver().describe_statement(rewrite_select_sql(sql));
+    }
+
     std::string rewrite_query(const std::string &sql) {
         if (!is_select_query_sql(sql)) {
             throw std::runtime_error("native branch rewrite only accepts SELECT");

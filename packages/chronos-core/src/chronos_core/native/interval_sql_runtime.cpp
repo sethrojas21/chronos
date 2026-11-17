@@ -2739,6 +2739,10 @@ class NativeSqlDriver {
     virtual const std::string &dialect() const = 0;
     virtual bool in_transaction() const = 0;
     virtual QueryResult query_result(const std::string &sql, const std::vector<Value> &params = {}) = 0;
+    // Prepares the query without running it; type OIDs are 0 when unknown.
+    virtual StatementDescription describe_statement(const std::string &) {
+        throw std::runtime_error(dialect() + " stores cannot describe a statement before running it");
+    }
     std::vector<std::vector<Value>> query(const std::string &sql, const std::vector<Value> &params = {}) {
         return query_result(sql, params).rows;
     }
@@ -2834,6 +2838,19 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
     }
     const std::string &dialect() const override { return dialect_; }
     bool in_transaction() const override { return sqlite3_get_autocommit(db_) == 0; }
+
+    StatementDescription describe_statement(const std::string &sql) override {
+        sqlite3_stmt *stmt = statement(sql);
+        StatementDescription description;
+        const int cols = sqlite3_column_count(stmt);
+        for (int c = 0; c < cols; ++c) {
+            const char *name = sqlite3_column_name(stmt, c);
+            description.columns.emplace_back(name ? name : "");
+            description.column_types.push_back(pg_type_for_declared_type(sqlite3_column_decltype(stmt, c)));
+        }
+        description.parameter_types.assign(static_cast<std::size_t>(sqlite3_bind_parameter_count(stmt)), 0);
+        return description;
+    }
 
     QueryResult query_result(const std::string &sql, const std::vector<Value> &params = {}) override {
         sqlite3_stmt *stmt = statement(sql);
@@ -3438,6 +3455,24 @@ class NativePostgresDriver final : public NativeSqlDriver {
     ~NativePostgresDriver() override { if (owns_connection_ && conn_) PQfinish(conn_); }
     const std::string &dialect() const override { return dialect_; }
     bool in_transaction() const override { return PQtransactionStatus(conn_) != PQTRANS_IDLE; }
+
+    StatementDescription describe_statement(const std::string &sql) override {
+        // The unnamed statement leaves the named statement cache untouched.
+        PgResult prepared(conn_, PQprepare(conn_, "", pg_sql_cached(sql).c_str(), 0, nullptr));
+        prepared.require(PGRES_COMMAND_OK);
+        PgResult described(conn_, PQdescribePrepared(conn_, ""));
+        described.require(PGRES_COMMAND_OK);
+        StatementDescription description;
+        PGresult *raw = described.get();
+        for (int c = 0; c < PQnfields(raw); ++c) {
+            description.columns.emplace_back(PQfname(raw, c));
+            description.column_types.push_back(static_cast<std::uint32_t>(PQftype(raw, c)));
+        }
+        for (int i = 0; i < PQnparams(raw); ++i) {
+            description.parameter_types.push_back(static_cast<std::uint32_t>(PQparamtype(raw, i)));
+        }
+        return description;
+    }
 
     QueryResult query_result(const std::string &sql, const std::vector<Value> &params = {}) override {
         const std::string &pg_sql = pg_sql_cached(sql);
