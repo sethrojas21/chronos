@@ -40,7 +40,8 @@ py::list copy_query_result_to_py_dicts(const IntervalQueryResult &result) {
     for (const auto &row : result.rows) {
         py::dict item;
         for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
-            item[result.columns[i].c_str()] = value_to_py(row[i]);
+            item[result.columns[i].c_str()] = value_to_py(
+                row[i], i < result.column_types.size() ? result.column_types[i] : 0);
         }
         out.append(item);
     }

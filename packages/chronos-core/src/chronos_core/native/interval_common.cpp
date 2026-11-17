@@ -247,7 +247,11 @@ struct NativeRowKeyHash {
     }
 };
 
-py::object value_to_py(const Value &value) {
+// type_oid is the column's PostgreSQL type OID as the store reports it, or 0
+// when unknown. Text is decoded as JSON only for json/jsonb columns; a column
+// of any other known type (such as TEXT) keeps its exact text. Unknown types
+// keep the older heuristic of decoding text that starts with '{' or '['.
+py::object value_to_py(const Value &value, std::uint32_t type_oid = 0) {
     if (std::holds_alternative<std::monostate>(value)) {
         return py::none();
     }
@@ -258,7 +262,9 @@ py::object value_to_py(const Value &value) {
         return py::float_(*ptr);
     }
     if (auto ptr = std::get_if<std::string>(&value)) {
-        if (!ptr->empty() && ((*ptr)[0] == '{' || (*ptr)[0] == '[')) {
+        const bool json_column = type_oid == 114 || type_oid == 3802;
+        const bool json_looking = !ptr->empty() && ((*ptr)[0] == '{' || (*ptr)[0] == '[');
+        if (json_column || (type_oid == 0 && json_looking)) {
             try {
                 return py::module_::import("json").attr("loads")(*ptr);
             } catch (...) {

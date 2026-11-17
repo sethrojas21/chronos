@@ -363,13 +363,16 @@ Value column_value(sqlite3_stmt *stmt, int index) {
     }
 }
 
+std::uint32_t pg_type_for_declared_type(const char *declared);
+
 py::list rows_from_statement(SqliteStatement &stmt) {
     py::list rows;
     const int column_count = sqlite3_column_count(stmt.get());
     while (stmt.step_row()) {
         py::dict row;
         for (int i = 0; i < column_count; ++i) {
-            row[sqlite3_column_name(stmt.get(), i)] = value_to_py(column_value(stmt.get(), i));
+            row[sqlite3_column_name(stmt.get(), i)] = value_to_py(
+                column_value(stmt.get(), i), pg_type_for_declared_type(sqlite3_column_decltype(stmt.get(), i)));
         }
         rows.append(row);
     }
@@ -410,7 +413,8 @@ class SQLiteConnector {
         while (stmt.step_row()) {
             py::dict row;
             for (int i = 0; i < column_count; ++i) {
-                row[sqlite3_column_name(stmt.get(), i)] = value_to_py(column_value(stmt.get(), i));
+                row[sqlite3_column_name(stmt.get(), i)] = value_to_py(
+                column_value(stmt.get(), i), pg_type_for_declared_type(sqlite3_column_decltype(stmt.get(), i)));
             }
             rows.append(row);
         }
@@ -809,7 +813,8 @@ py::list rows_from_pg_result(PGresult *result) {
     for (int r = 0; r < row_count; ++r) {
         py::dict row;
         for (int c = 0; c < column_count; ++c) {
-            row[PQfname(result, c)] = value_to_py(pg_column_value(result, r, c));
+            row[PQfname(result, c)] = value_to_py(
+                pg_column_value(result, r, c), static_cast<std::uint32_t>(PQftype(result, c)));
         }
         rows.append(row);
     }
@@ -2966,6 +2971,18 @@ class NativeSQLiteDriver final : public NativeSqlDriver {
 };
 
 #ifdef CHRONOS_WITH_DUCKDB
+// PostgreSQL type OID for text-like DuckDB columns, so JSON is decoded only
+// for JSON columns; 0 for other types, whose values carry their own type.
+std::uint32_t duckdb_column_pg_type(duckdb_result *result, idx_t column) {
+    if (duckdb_column_type(result, column) != DUCKDB_TYPE_VARCHAR) return 0;
+    duckdb_logical_type logical = duckdb_column_logical_type(result, column);
+    char *alias = duckdb_logical_type_get_alias(logical);
+    const bool json = alias && std::string(alias) == "JSON";
+    if (alias) duckdb_free(alias);
+    duckdb_destroy_logical_type(&logical);
+    return json ? 114 : 25;
+}
+
 class NativeDuckDBDriver final : public NativeSqlDriver {
   public:
     explicit NativeDuckDBDriver(const std::string &database_url) : dialect_("duckdb") {
@@ -3008,6 +3025,7 @@ class NativeDuckDBDriver final : public NativeSqlDriver {
         for (idx_t c = 0; c < cols; ++c) {
             const char *name = duckdb_column_name(result.get(), c);
             out.columns.emplace_back(name ? name : "");
+            out.column_types.push_back(duckdb_column_pg_type(result.get(), c));
         }
         out.rows.reserve(static_cast<std::size_t>(rows));
         for (idx_t r = 0; r < rows; ++r) {

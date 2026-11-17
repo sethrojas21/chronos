@@ -869,7 +869,7 @@ IntervalQueryResult NativeBranchStore::query_sql_result(
     const std::vector<IntervalValue> &params
 ) {
     QueryResult result = impl_->query_sql_result(sql, params);
-    return {std::move(result.columns), std::move(result.rows)};
+    return {std::move(result.columns), std::move(result.rows), std::move(result.column_types)};
 }
 
 void NativeBranchStore::execute_sql(
@@ -903,7 +903,7 @@ IntervalQueryResult NativeSqlConnection::query_sql_result(
     const std::vector<IntervalValue> &params
 ) {
     QueryResult result = impl_->query_sql_result(sql, params);
-    return {std::move(result.columns), std::move(result.rows)};
+    return {std::move(result.columns), std::move(result.rows), std::move(result.column_types)};
 }
 
 void NativeSqlConnection::execute_sql(
@@ -1032,7 +1032,8 @@ void bind_interval_data_plane(py::module_ &m) {
                 for (const auto &row : result.rows) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
-                        item[result.columns[i].c_str()] = value_to_py(row[i]);
+                        item[result.columns[i].c_str()] = value_to_py(
+                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
                     }
                     out.append(item);
                 }
@@ -1054,7 +1055,8 @@ void bind_interval_data_plane(py::module_ &m) {
                 for (const auto &row : result.rows) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
-                        item[result.columns[i].c_str()] = value_to_py(row[i]);
+                        item[result.columns[i].c_str()] = value_to_py(
+                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
                     }
                     out.append(item);
                 }
@@ -1571,7 +1573,8 @@ void bind_interval_data_plane(py::module_ &m) {
                 for (const auto &row : result.rows) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
-                        item[result.columns[i].c_str()] = value_to_py(row[i]);
+                        item[result.columns[i].c_str()] = value_to_py(
+                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
                     }
                     out.append(item);
                 }
@@ -1631,7 +1634,8 @@ void bind_interval_data_plane(py::module_ &m) {
                 for (const auto &row : result.rows) {
                     py::dict item;
                     for (std::size_t i = 0; i < result.columns.size() && i < row.size(); ++i) {
-                        item[result.columns[i].c_str()] = value_to_py(row[i]);
+                        item[result.columns[i].c_str()] = value_to_py(
+                            row[i], i < result.column_types.size() ? result.column_types[i] : 0);
                     }
                     out.append(item);
                 }

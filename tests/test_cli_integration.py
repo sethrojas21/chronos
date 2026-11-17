@@ -599,6 +599,15 @@ class TestWorkspaceSQLWorkflows:
             {"id": 1, "value": "updated"},
         ]
 
+    def test_text_that_looks_like_json_stays_text(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
+        invoke = partial(_invoke_workspace, _workspace_config_file(tmp_path, cli_database))
+        invoke("table", "create", "--store", "app", "CREATE TABLE seq (key TEXT PRIMARY KEY, value TEXT)")
+        invoke("table", "register", "--store", "app", "seq", "--primary-key", "key")
+        stored = {"a": '{"name":"writes","value":1}', "b": "[1,2]", "c": "123", "d": "true", "e": "null"}
+        invoke("upsert", "seq", json.dumps([{"key": k, "value": v} for k, v in stored.items()]), "--store", "app")
+        rows = invoke("query", "SELECT key, value FROM seq ORDER BY key", "--store", "app")
+        assert {row["key"]: row["value"] for row in rows} == stored
+
     def test_table_info(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)
