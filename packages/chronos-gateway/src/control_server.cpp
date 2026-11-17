@@ -508,5 +508,6 @@ ControlServer::ControlServer(
 ControlServer::~ControlServer() = default;
 void ControlServer::run() { impl_->run(); }
 void ControlServer::stop() { impl_->stop(); }
+PythonControl &ControlServer::python_control() { return impl_->python; }
 
 } // namespace chronos::gateway

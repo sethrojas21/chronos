@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
                 config.controller_token,
                 config.workspaces);
             chronos::gateway::PostgresServer postgres_server(runtime, config.postgres);
+            postgres_server.set_python_control(&server.python_control());
             std::optional<chronos::gateway::NfsServer> nfs_server;
             if (config.nfs_enabled) nfs_server.emplace(runtime, config.nfs, config.nfs_runtime);
             std::signal(SIGINT, stop_server);

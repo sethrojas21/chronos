@@ -77,20 +77,46 @@ errors.
 | `POST .../merges/apply` | `merge_apply` | `source`, `target`, `policy` |
 | `POST .../merges/atomic-preview` | `merge_atomic_preview` | `source`, `target`, `policy` |
 | `POST .../merges/atomic-apply` | `merge_atomic` | `source`, `target`, `operation_id`, `preview_token`, `policy` |
-| `POST .../tables` | `register_table` (201) | `store`, `table`, `primary_key` |
+| `POST .../tables` | `register_table` (201) | `store`, `table`, `primary_key`, optional `create_sql` (a CREATE TABLE run first, as `table create`) |
 | `GET .../tables/{table}` | `table_info` | `?store` |
 | `POST .../tables/{table}/indexes` | `create_index` (201) | `store`, `columns`, `name` |
 
 `.../` is `/v1/workspaces/{workspace}/`. `policy` is `abort_on_conflict` (the
 default, as in the CLI), `snapshot_isolation`, or `api-default`. Each workspace
-opens on its first versioning request, with branch-local schema as the
-gateway's stores use, and stays open; its requests run one at a time.
+opens on its first versioning request, with the table structure mode of its
+configuration (below), and stays open; its requests run one at a time.
 
 All stores of a gateway workspace share one metadata database, so the workspace
 is atomic: use the atomic merge routes, since `merges/apply` is refused as in a
 CLI workspace with `shared_metadata_url`. A workspace with several stores
 (including a filesystem) refuses diff and merges, because the CLI requires
 `merge_tables` for that layout and the gateway configuration has none yet.
+
+## Shared or per-branch table structure
+
+Each workspace chooses how table structure is versioned with
+`"schema_branching"` (default `true`):
+
+- `true`: each branch has its own table structure, and SQL clients may run DDL
+  on their branch. The Python API and the engine cannot yet diff or merge
+  tables in this mode with the gateway's separate metadata database, so the
+  versioning routes refuse it.
+- `false`: one table structure is shared by every branch, as in the CLI; only
+  rows are versioned. Diff, merges, checkpoints, and table info work. A SQL
+  client's `CREATE TABLE` (with a primary key, `IF NOT EXISTS` honored) creates
+  and registers the table for every branch, and `CREATE INDEX` creates a
+  Chronos index; a partial index (`WHERE`) becomes a plain index on the same
+  columns. These run outside the client's transaction: the table or index
+  exists on every branch as soon as the statement returns, and `ROLLBACK` does
+  not remove it. Other DDL (`ALTER`, `DROP`, unique or expression indexes,
+  tables without a primary key, PostgreSQL schemas) is refused with SQLSTATE
+  `0A000`. The translation is `chronos_core.control.ddl`.
+
+`information_schema.columns` reflects a shared table's columns.
+`pg_indexes` does not yet list Chronos indexes.
+
+`run-local.sh` runs workspace `local` with the default and workspace `shared`
+with `"schema_branching": false`, each on its own databases.
 
 `run-local.sh` installs chronos-core into its build volume. Elsewhere, install
 it for the Python the gateway links (`python3 -m pip install

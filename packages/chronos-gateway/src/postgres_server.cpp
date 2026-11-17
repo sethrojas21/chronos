@@ -1,4 +1,7 @@
 #include "chronos/gateway/postgres_server.hpp"
+#include "chronos/gateway/python_control.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <boost/asio.hpp>
 
@@ -11,6 +14,7 @@
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <functional>
 #include <stdexcept>
 #include <sstream>
 #include <thread>
@@ -323,8 +327,13 @@ struct Execution {
     std::string tag;
 };
 
+// Runs CREATE TABLE / CREATE INDEX for every branch of a shared-structure
+// workspace and returns the command tag.
+using SharedDdl = std::function<std::string(const std::string &sql)>;
+
 Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
-                      const std::vector<IntervalValue> &params) {
+                      const std::vector<IntervalValue> &params,
+                      const SharedDdl &shared_ddl = {}) {
     enforce_branch_sql_boundary(sql);
     auto &session = branch_session.session();
     const std::string keyword = lower_keyword(sql);
@@ -332,10 +341,13 @@ Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
     if (!branch_session.schema_branching() &&
         (keyword == "create" || keyword == "alter" || keyword == "drop")) {
         // A branch-local definition would give this branch its own table
-        // structure, which a shared-structure workspace cannot merge.
+        // structure, which a shared-structure workspace cannot merge. CREATE
+        // TABLE and CREATE INDEX instead apply to every branch, outside the
+        // client's transaction (see chronos_core.control.ddl).
+        if (keyword == "create" && shared_ddl) return {false, {}, shared_ddl(sql)};
         throw GatewayError(
             "table structure is shared by every branch in this workspace; "
-            "create and register tables through the control API (POST .../tables)");
+            "only CREATE TABLE and CREATE INDEX are accepted, for every branch");
     }
     if (keyword == "begin" || keyword == "start") {
         session.begin();
@@ -389,6 +401,9 @@ class PostgresServer::Impl {
         : runtime(runtime), listen(std::move(listen)), acceptor(io) {}
 
     ~Impl() { stop(); join_clients(); }
+
+    // Set by PostgresServer::set_python_control before run().
+    PythonControl *python = nullptr;
 
     void run() {
         const auto address = asio::ip::make_address(listen.host);
@@ -500,6 +515,22 @@ class PostgresServer::Impl {
             std::size_t password_offset = 0;
             const auto password = take_cstring(password_payload, password_offset);
             auto branch_session = runtime.open_postgres(user->second, password, database->second);
+            const std::string workspace_name = branch_session->access_grant().workspace;
+            const std::string store_alias = database->second;
+            const SharedDdl shared_ddl = [this, &workspace_name, &store_alias](const std::string &sql) {
+                if (!python) throw GatewayError("table creation needs the gateway's Python control");
+                const nlohmann::json arguments = {{"store", store_alias}, {"sql", sql}};
+                const auto result = python->call(workspace_name, "apply_ddl", arguments.dump());
+                const auto body = nlohmann::json::parse(result.body, nullptr, false);
+                const bool object = body.is_object();
+                const auto message = object ? body.value("error", std::string("table creation failed"))
+                                            : std::string("table creation failed");
+                if (result.status != 200) {
+                    throw SqlStateError(message, object ? body.value("sqlstate", std::string("XX000"))
+                                                        : std::string("XX000"));
+                }
+                return body.at("tag").get<std::string>();
+            };
 
             send_auth(socket, 0);
             send_parameter(socket, "server_version", "17.0-chronos");
@@ -544,7 +575,7 @@ class PostgresServer::Impl {
                         std::size_t offset = 0;
                         const auto sql = take_cstring(payload, offset);
                         auto execution = failed_transaction_reply(lower_keyword(sql));
-                        if (!execution) execution = execute_sql(*branch_session, sql, {});
+                        if (!execution) execution = execute_sql(*branch_session, sql, {}, shared_ddl);
                         send_execution(socket, *execution, true);
                         failed_transaction = false;
                         send_ready(socket, branch_session->session().in_transaction() ? 'T' : 'I');
@@ -605,7 +636,7 @@ class PostgresServer::Impl {
                             // A failed transaction runs nothing; Execute reports the error.
                             if (!failed_transaction &&
                                 (keyword == "select" || keyword == "with" || keyword == "show")) {
-                                auto execution = execute_sql(*branch_session, found->second.sql, found->second.params);
+                                auto execution = execute_sql(*branch_session, found->second.sql, found->second.params, shared_ddl);
                                 found->second.described_result = std::move(execution.rows);
                                 send_row_description(socket, *found->second.described_result);
                             } else send_message(socket, 'n', {});
@@ -623,7 +654,7 @@ class PostgresServer::Impl {
                             send_execution(socket, execution, false);
                         } else {
                             send_execution(socket, execute_sql(
-                                *branch_session, found->second.sql, found->second.params), false);
+                                *branch_session, found->second.sql, found->second.params, shared_ddl), false);
                         }
                         // Only ROLLBACK can succeed in a failed transaction.
                         failed_transaction = false;
@@ -674,5 +705,6 @@ PostgresServer::PostgresServer(GatewayRuntime &runtime, ListenAddress listen)
 PostgresServer::~PostgresServer() = default;
 void PostgresServer::run() { impl_->run(); }
 void PostgresServer::stop() { impl_->stop(); }
+void PostgresServer::set_python_control(PythonControl *python) { impl_->python = python; }
 
 } // namespace chronos::gateway

@@ -10,6 +10,8 @@
 
 namespace chronos::gateway {
 
+class PythonControl;
+
 class ControlServer {
   public:
     ControlServer(
@@ -26,6 +28,8 @@ class ControlServer {
 
     void run();
     void stop();
+    // The embedded Python bridge, shared with the PostgreSQL frontend.
+    PythonControl &python_control();
 
   private:
     class Impl;
