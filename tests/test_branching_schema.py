@@ -1401,8 +1401,6 @@ def test_postgres_interval_alter_column_type_using_expression() -> None:
     [
         "CREATE VIEW product_names AS SELECT sku FROM products",
         "CREATE SEQUENCE product_seq",
-        "CREATE TABLE table_pk (id TEXT, body TEXT, PRIMARY KEY (id))",
-        "CREATE TABLE constrained (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
         "CREATE TABLE no_pk (id TEXT, body TEXT)",
         "ALTER TABLE products ADD COLUMN score INTEGER DEFAULT abs(1)",
         "ALTER TABLE products ADD COLUMN score INTEGER NOT NULL",
@@ -1422,6 +1420,23 @@ def test_postgres_unsupported_ddl_matrix_is_rejected(ddl: str) -> None:
         ctx.create_branch("exp", from_branch="main")
         with pytest.raises(UnsupportedSQLError):
             ctx.checkout("exp").execute(ddl)
+    finally:
+        ctx.close()
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE TABLE table_pk (id TEXT, body TEXT, PRIMARY KEY (id))",
+        "CREATE TABLE constrained (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+        "ALTER TABLE products ADD COLUMN score INTEGER NOT NULL DEFAULT 0",
+    ],
+)
+def test_postgres_primary_key_and_not_null_ddl_is_supported(ddl: str) -> None:
+    ctx = _ctx("postgres", enable_schema_branching=True)
+    try:
+        ctx.create_branch("exp", from_branch="main")
+        ctx.checkout("exp").execute(ddl)
     finally:
         ctx.close()
 

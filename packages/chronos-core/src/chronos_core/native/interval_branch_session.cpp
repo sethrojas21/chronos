@@ -1466,7 +1466,7 @@ class NativeBranchSessionImpl {
                 "column constraints other than PRIMARY KEY, NOT NULL, NULL, and constant DEFAULT are not supported");
         }
         if (not_null && !allow_primary_key && default_sql.empty()) {
-            throw std::runtime_error("ADD COLUMN ... NOT NULL requires a DEFAULT");
+            throw std::runtime_error("unsupported ADD COLUMN ... NOT NULL without a DEFAULT");
         }
         const std::string column = column_def->colname;
         // NOT NULL is kept in Chronos's column definition, before DEFAULT, and
