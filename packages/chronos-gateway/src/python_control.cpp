@@ -32,7 +32,8 @@ std::string python_control_config(const std::unordered_map<std::string, Workspac
         for (const auto &[alias, store] : workspace.postgres_stores) {
             stores[alias] = store_json(store.data_url, store.metadata_url);
         }
-        Json entry = {{"stores", std::move(stores)}, {"filesystem", nullptr}};
+        Json entry = {{"stores", std::move(stores)}, {"filesystem", nullptr},
+                      {"schema_branching", workspace.schema_branching}};
         if (workspace.filesystem) {
             entry["filesystem"] = store_json(workspace.filesystem->data_url, workspace.filesystem->metadata_url);
         }

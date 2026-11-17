@@ -70,6 +70,13 @@ def merge_atomic(workspace: ChronosWorkspaceContext, source: str, target: str, *
     )
 
 
+def create_table(workspace: ChronosWorkspaceContext, store: str, sql: str) -> Any:
+    """Run one ordinary CREATE TABLE on the store, as `chronos table create` does."""
+    database = workspace.stores[store]
+    database.db.execute(sql)
+    return database.db.commit()
+
+
 def register_table(workspace: ChronosWorkspaceContext, store: str, table: str, primary_key: list[str]) -> Any:
     return workspace.stores[store].register_table(table, primary_key)
 

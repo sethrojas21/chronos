@@ -45,7 +45,7 @@ void GatewayRuntime::add_workspace(const std::string &name, const WorkspaceConfi
               control_data_url, control_metadata_url);
     // Gateway clients may issue branch-local DDL. Migrate tables registered by
     // older callers into the schema-version catalog before serving branches.
-    entry->control_store->ensure(true);
+    entry->control_store->ensure(config.schema_branching);
 
     if (config.filesystem) {
         entry->filesystem = std::make_unique<chronos::native::NativeChronosFilesystem>(
@@ -230,8 +230,10 @@ std::unique_ptr<SqlBranchSession> GatewayRuntime::open_postgres(
         : std::make_unique<chronos::native::NativeBranchStore>(
               found->second.data_url, found->second.metadata_url);
     auto session = store->checkout(grant.branch);
-    return std::make_unique<SqlBranchSession>(
+    auto opened = std::make_unique<SqlBranchSession>(
         std::move(store), std::move(session), std::move(grant));
+    opened->set_schema_branching(target->config.schema_branching);
+    return opened;
 }
 
 chronos::native::NativeChronosFilesystem &GatewayRuntime::authorize_filesystem(

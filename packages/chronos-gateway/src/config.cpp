@@ -146,6 +146,7 @@ GatewayConfig load_config(const std::string &path) {
     }
     for (auto workspace = workspaces.begin(); workspace != workspaces.end(); ++workspace) {
         WorkspaceConfig parsed;
+        parsed.schema_branching = workspace.value().value("schema_branching", true);
         const auto shared_metadata_env = workspace.value().value(
             "metadata_url_env", std::string{});
         const std::string shared_metadata = shared_metadata_env.empty()

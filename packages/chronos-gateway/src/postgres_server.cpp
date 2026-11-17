@@ -329,6 +329,14 @@ Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
     auto &session = branch_session.session();
     const std::string keyword = lower_keyword(sql);
     if (keyword.empty()) return {false, {}, ""};
+    if (!branch_session.schema_branching() &&
+        (keyword == "create" || keyword == "alter" || keyword == "drop")) {
+        // A branch-local definition would give this branch its own table
+        // structure, which a shared-structure workspace cannot merge.
+        throw GatewayError(
+            "table structure is shared by every branch in this workspace; "
+            "create and register tables through the control API (POST .../tables)");
+    }
     if (keyword == "begin" || keyword == "start") {
         session.begin();
         return {false, {}, "BEGIN"};

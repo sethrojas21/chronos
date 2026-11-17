@@ -66,7 +66,7 @@ for _ in $(seq 60); do
     docker exec "$pg_container" pg_isready -U postgres >/dev/null 2>&1 && break
     sleep 1
 done
-for db in chronos_data chronos_metadata; do
+for db in chronos_data chronos_metadata chronos_shared_data chronos_shared_metadata; do
     docker exec "$pg_container" psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$db'" \
         | grep -q 1 || docker exec "$pg_container" createdb -U postgres "$db"
 done
@@ -79,6 +79,8 @@ docker run -d --name "$gw_container" --network "$network" \
     -e PYTHONPATH=/build/python \
     -e CHRONOS_METADATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_metadata" \
     -e CHRONOS_APP_DATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_data" \
+    -e CHRONOS_SHARED_METADATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_shared_metadata" \
+    -e CHRONOS_SHARED_DATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_shared_data" \
     "$image" bash -c "
         ip=\$(hostname -i | awk '{print \$1}')
         cat > /tmp/gateway.json <<JSON
@@ -93,6 +95,11 @@ docker run -d --name "$gw_container" --network "$network" \
     \"local\": {
       \"metadata_url_env\": \"CHRONOS_METADATA_URL\",
       \"postgres\": {\"app\": {\"data_url_env\": \"CHRONOS_APP_DATA_URL\"}}
+    },
+    \"shared\": {
+      \"schema_branching\": false,
+      \"metadata_url_env\": \"CHRONOS_SHARED_METADATA_URL\",
+      \"postgres\": {\"app\": {\"data_url_env\": \"CHRONOS_SHARED_DATA_URL\"}}
     }
   }
 }
@@ -107,7 +114,8 @@ curl -fsS "http://127.0.0.1:${control_port}/healthz" >/dev/null || {
     docker logs "$gw_container" >&2; exit 1; }
 
 cat <<INFO
-chronos-gateway is running (workspace "local", SQL store "app").
+chronos-gateway is running (workspaces "local" and "shared", SQL store "app").
+  "shared" keeps one table structure on every branch, so its branches can be merged.
   control API: http://127.0.0.1:${control_port}   token: ${token}
   PostgreSQL:  localhost:${postgres_port}   (credentials come from the control API)
 

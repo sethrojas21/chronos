@@ -91,6 +91,8 @@ class _Workspace:
     # Diff and merge need every SQL store scoped to its own tables when several
     # participants share one metadata plane, as the CLI requires.
     merge_scoped: bool
+    # Branch-local schema, as the gateway's native stores are opened.
+    schema_branching: bool = True
     lock: threading.Lock = field(default_factory=threading.Lock)
     resources: ExitStack | None = None
     context: ChronosWorkspaceContext | None = None
@@ -132,7 +134,7 @@ def _workspace_config(name: str, entry: dict[str, Any]) -> _Workspace:
     participants = len(stores) + (filesystem is not None)
     merge_scoped = participants == 1 or all(store.merge_tables for store in stores.values())
     config = WorkspaceConfig(Path("."), stores, shared, filesystem)
-    return _Workspace(config, tuple(urls), merge_scoped)
+    return _Workspace(config, tuple(urls), merge_scoped, bool(entry.get("schema_branching", True)))
 
 
 # Each handler validates its arguments against the workspace configuration
@@ -190,7 +192,14 @@ def _merge_atomic(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
 
 def _register_table(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     store, table, primary_key = _store(c, a), _text(a, "table"), _names(a, "primary_key")
-    return lambda ws: operations.register_table(ws, store, table, primary_key)
+    create_sql = _text(a, "create_sql", required=False)
+
+    def run(ws: Any) -> Any:
+        # Optional CREATE TABLE first, as `chronos table create` then `table register`.
+        if create_sql is not None:
+            operations.create_table(ws, store, create_sql)
+        return operations.register_table(ws, store, table, primary_key)
+    return run
 
 
 def _table_info(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
@@ -216,7 +225,7 @@ _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[st
     "merge_atomic_preview": (_merge("merge_atomic_preview"), frozenset({"source", "target", "policy"}), 200, True),
     "merge_atomic": (
         _merge_atomic, frozenset({"source", "target", "policy", "operation_id", "preview_token"}), 200, True),
-    "register_table": (_register_table, frozenset({"store", "table", "primary_key"}), 201, False),
+    "register_table": (_register_table, frozenset({"store", "table", "primary_key", "create_sql"}), 201, False),
     "table_info": (_table_info, frozenset({"store", "table"}), 200, False),
     "create_index": (_create_index, frozenset({"store", "table", "columns", "name"}), 201, False),
 }
@@ -303,7 +312,7 @@ class GatewayControl:
 
             resources = ExitStack()
             try:
-                context = resources.enter_context(open_workspace(entry.config, schema_branching=True))
+                context = resources.enter_context(open_workspace(entry.config, schema_branching=entry.schema_branching))
             except BaseException:
                 resources.close()
                 raise

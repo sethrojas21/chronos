@@ -28,6 +28,11 @@ struct FilesystemConfig {
 struct WorkspaceConfig {
     std::unordered_map<std::string, StoreConfig> postgres_stores;
     std::optional<FilesystemConfig> filesystem;
+    // Branch-local schema: each branch has its own table structure, and SQL
+    // clients may run DDL on their branch. When false, table structure is
+    // shared by every branch (as in the CLI): tables are created and
+    // registered through the control API, and branches can be merged.
+    bool schema_branching = true;
 };
 
 // This is the protocol-facing form of ChronosWorkspaceContext.create_branch:
@@ -82,6 +87,10 @@ class SqlBranchSession {
 
     chronos::native::NativeBranchSession &session() { return session_; }
     const AccessGrant &access_grant() const { return access_grant_; }
+    // False when the workspace shares one table structure across branches;
+    // SQL clients then may not change table structure on a branch.
+    bool schema_branching() const { return schema_branching_; }
+    void set_schema_branching(bool enabled) { schema_branching_ = enabled; }
 
   private:
     // The session borrows driver state owned by the store, so destruction order
@@ -89,6 +98,7 @@ class SqlBranchSession {
     std::unique_ptr<chronos::native::NativeBranchStore> store_;
     chronos::native::NativeBranchSession session_;
     AccessGrant access_grant_;
+    bool schema_branching_ = true;
 };
 
 class GatewayRuntime {
