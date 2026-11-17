@@ -9,6 +9,8 @@
 # Ports on 127.0.0.1: control API ${CHRONOS_GATEWAY_CONTROL_PORT:-7400},
 # PostgreSQL wire ${CHRONOS_GATEWAY_POSTGRES_PORT:-6543}. Workspace "local" has one
 # SQL store, "app". Data persists in the Docker volume until "stop --clean".
+# The build volume also holds the chronos-core Python package (/build/python),
+# which the gateway embeds for its versioning routes.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,14 +39,18 @@ build() {
     docker run --rm -v "$repo":/src -v "$build_volume":/build "$image" bash -c \
         "cmake -S packages/chronos-gateway -B /build -DCMAKE_BUILD_TYPE=Release \
                -DCHRONOS_GATEWAY_BUILD_TESTS=OFF >/dev/null && \
-         cmake --build /build -j\$(nproc) --target chronos-gateway"
+         cmake --build /build -j\$(nproc) --target chronos-gateway && \
+         SKBUILD_BUILD_DIR=/build/chronos-core-python python3 -m pip install -q \
+             --disable-pip-version-check --no-warn-script-location --upgrade \
+             --target /build/python packages/chronos-core"
 }
 
 case "${1:-start}" in
     stop) stop "${2:-}"; exit 0 ;;
     rebuild) build ;;
     start)
-        if ! docker run --rm -v "$build_volume":/build "$image" test -x /build/chronos-gateway 2>/dev/null; then
+        if ! docker run --rm -v "$build_volume":/build "$image" \
+                test -x /build/chronos-gateway -a -d /build/python/chronos_core 2>/dev/null; then
             build
         fi ;;
     *) echo "usage: $0 [start|rebuild|stop [--clean]]" >&2; exit 2 ;;
@@ -70,6 +76,7 @@ docker run -d --name "$gw_container" --network "$network" \
     -p "127.0.0.1:${control_port}:7400" -p "127.0.0.1:${postgres_port}:6543" \
     -v "$build_volume":/build \
     -e CHRONOS_CONTROLLER_TOKEN="$token" \
+    -e PYTHONPATH=/build/python \
     -e CHRONOS_METADATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_metadata" \
     -e CHRONOS_APP_DATA_URL="postgresql://postgres:postgres@${pg_container}:5432/chronos_data" \
     "$image" bash -c "

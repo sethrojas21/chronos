@@ -54,6 +54,49 @@ POST /v1/workspaces/training/branches
   access, and never returns credentials. `DELETE` deletes a long-lived branch
   immediately, while for a sandbox it closes access as before.
 
+## Versioning routes
+
+These routes run Chronos's versioning operations through the chronos-core
+Python package, which the gateway embeds: each route calls one function of
+`chronos_core.control.operations`, the same function the `chronos` CLI command
+calls, so the two behave alike. All need the controller bearer token. Arguments
+come from the JSON body, the query string, and the path, and use the CLI's
+names. Responses are the API's result as JSON, or `{"error": "..."}` with 404
+for an unknown workspace, store, branch, or table, 400 for invalid arguments or
+a refused operation, and 500 otherwise. Configured database URLs never appear in
+errors.
+
+| Route | Operation (CLI command) | Arguments |
+| --- | --- | --- |
+| `GET .../branches` | `list_branches` (`branch list`) | `?store` for one store's records with metadata |
+| `PUT .../branches/{id}/metadata` | `update_branch_metadata` | `store`, `metadata` |
+| `POST .../checkpoints` | `create_checkpoint` (201) | `name`, `branch` (default `main`), `metadata` |
+| `GET .../checkpoints` | `list_checkpoints` | `?store`, `?branch`, `?metadata_filter` (JSON) |
+| `GET .../diff` | `diff` | `?left`, `?right` |
+| `POST .../merges/preview` | `merge_preview` | `source`, `target`, `policy` |
+| `POST .../merges/apply` | `merge_apply` | `source`, `target`, `policy` |
+| `POST .../merges/atomic-preview` | `merge_atomic_preview` | `source`, `target`, `policy` |
+| `POST .../merges/atomic-apply` | `merge_atomic` | `source`, `target`, `operation_id`, `preview_token`, `policy` |
+| `POST .../tables` | `register_table` (201) | `store`, `table`, `primary_key` |
+| `GET .../tables/{table}` | `table_info` | `?store` |
+| `POST .../tables/{table}/indexes` | `create_index` (201) | `store`, `columns`, `name` |
+
+`.../` is `/v1/workspaces/{workspace}/`. `policy` is `abort_on_conflict` (the
+default, as in the CLI), `snapshot_isolation`, or `api-default`. Each workspace
+opens on its first versioning request, with branch-local schema as the
+gateway's stores use, and stays open; its requests run one at a time.
+
+All stores of a gateway workspace share one metadata database, so the workspace
+is atomic: use the atomic merge routes, since `merges/apply` is refused as in a
+CLI workspace with `shared_metadata_url`. A workspace with several stores
+(including a filesystem) refuses diff and merges, because the CLI requires
+`merge_tables` for that layout and the gateway configuration has none yet.
+
+`run-local.sh` installs chronos-core into its build volume. Elsewhere, install
+it for the Python the gateway links (`python3 -m pip install
+packages/chronos-core`, or set `PYTHONPATH`). Without it these routes answer
+501 and the rest of the gateway works as before.
+
 The executable contains the control server, PostgreSQL wire frontend,
 ChronosFS capability view, and NFS-Ganesha server in one process. Ganesha is
 loaded as a library and reads the in-process ChronosFS FUSE mount through its
