@@ -405,6 +405,22 @@ class NativeBranchSessionImpl {
         if (select_rewrite_cache_.size() > 512) {
             select_rewrite_cache_.clear();
         }
+        auto replacements = visible_table_replacements();
+        if (references_unknown_tables(sql, replacements)) {
+            // Another process may have registered a table since this session
+            // read the registry; a stale registry would read the table as a
+            // plain one. Reread it once per new statement text (rewrites are
+            // cached per text, so repeated statements pay nothing). Names that
+            // stay unknown are plain tables or CTE names.
+            reload_table_registry();
+            replacements = visible_table_replacements();
+        }
+        validate_referenced_tables_visible(sql, replacements);
+        auto inserted = select_rewrite_cache_.emplace(sql, rewrite_visible_tables(sql, replacements));
+        return inserted.first->second;
+    }
+
+    std::unordered_map<std::string, std::string> visible_table_replacements() {
         std::unordered_map<std::string, std::string> replacements;
         for (const auto &meta : table_metas_for_session()) {
             const std::string cols = select_columns_sql(meta.columns);
@@ -418,9 +434,27 @@ class NativeBranchSessionImpl {
                     " WHERE " + visible_select_where_sql(segment_.branch_point, store_.dialect())
             );
         }
-        validate_referenced_tables_visible(sql, replacements);
-        auto inserted = select_rewrite_cache_.emplace(sql, rewrite_visible_tables(sql, replacements));
-        return inserted.first->second;
+        return replacements;
+    }
+
+    bool references_unknown_tables(
+        const std::string &sql,
+        const std::unordered_map<std::string, std::string> &active_tables
+    ) {
+        for (const auto &table : scan_referenced_table_names(sql)) {
+            if (active_tables.find(table) == active_tables.end()) return true;
+        }
+        return false;
+    }
+
+    // Drops this session's view of the table registry. Cached rewrites are
+    // kept: those of registered tables stay valid. A statement text rewritten
+    // while one of its tables was still unregistered keeps reading it as a
+    // plain table until the session is checked out again.
+    void reload_table_registry() {
+        table_metas_cache_.reset();
+        known_table_names_cache_.reset();
+        table_meta_by_name_.clear();
     }
 
     void validate_referenced_tables_visible(

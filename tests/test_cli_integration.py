@@ -656,10 +656,14 @@ class TestWorkspaceSQLWorkflows:
             with open_workspace(load_workspace_config(config)) as workspace:
                 store = workspace.stores["app"]
                 assert store.describe_table("audit").registered is False
+                # A session that has already read the registry, as in a long-lived process.
+                session = store.checkout("main")
+                assert session.query("SELECT key FROM skill WHERE key = 'none'") == []
                 one_shot(["table", "register", "--store", "app", "audit", "--primary-key", "id"])
                 assert store.describe_table("audit").primary_key == ("id",)
-                # Writes through the already open context find the new table too.
-                session = store.checkout("main")
+                one_shot(["upsert", "audit", '[{"id": 2}]', "--store", "app"])
+                # Reads and writes through the already open session find the new table.
+                assert session.query("SELECT id FROM audit") == [{"id": 2}]
                 assert session.upsert_rows("audit", [{"id": 1}]).rowcount == 1
                 with pytest.raises(TableNotRegisteredError, match="'nowhere' is not registered"):
                     session.upsert_rows("nowhere", [{"id": 1}])
