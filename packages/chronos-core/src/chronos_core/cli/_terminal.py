@@ -3,16 +3,15 @@ from __future__ import annotations
 
 import base64
 import json
-import re
 import sys
 from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
-from urllib.parse import parse_qsl, unquote, urlsplit
 
 import typer
 
 from chronos_core.control.encoding import json_default
+from chronos_core.control.redaction import redact_message
 
 
 class MergePolicy(str, Enum):
@@ -86,25 +85,5 @@ def report_error(
     error: Exception, *, secrets: tuple[str | None, ...] = (), urls: tuple[str | None, ...] = (),
 ) -> NoReturn:
     """Report an operational failure without exposing configured credentials."""
-    message = str(error)
-    sensitive = [secret for secret in secrets if secret]
-    for url in urls:
-        if url:
-            message = message.replace(url, "<database>")
-            try:
-                parsed = urlsplit(url)
-            except ValueError:
-                continue
-            if parsed.password:
-                sensitive.extend((parsed.password, unquote(parsed.password)))
-            sensitive.extend(value for key, value in parse_qsl(parsed.query) if key == "password" and value)
-            for item in parsed.query.split("&"):
-                key, separator, value = item.partition("=")
-                if separator and unquote(key) == "password" and value:
-                    sensitive.append(value)
-    for secret in sorted(set(sensitive), key=len, reverse=True):
-        message = message.replace(secret, "<redacted>")
-    message = re.sub(r"([a-zA-Z][\w+.-]*://)[^\s/@]+@", r"\1<credentials>@", message)
-    message = re.sub(r"(?i)(password\s*=\s*)(?:'[^']*'|\"[^\"]*\"|[^\s]+)", r"\1<redacted>", message)
-    typer.echo(f"Error: {message}", err=True)
+    typer.echo(f"Error: {redact_message(str(error), secrets=secrets, urls=urls)}", err=True)
     raise typer.Exit(1) from error
