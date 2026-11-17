@@ -286,12 +286,20 @@ def load_workspace_config(path: Path | None = None) -> WorkspaceConfig:
 
 
 @contextmanager
-def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext, None, None]:
-    """Close every owned resource; never remove persistent data or replace an API error."""
+def open_workspace(
+    config: WorkspaceConfig, *, schema_branching: bool = False,
+) -> Generator[ChronosWorkspaceContext, None, None]:
+    """Close every owned resource; never remove persistent data or replace an API error.
+
+    schema_branching opens SQL and ChronosFS contexts with branch-local schema,
+    as the gateway's native stores use it.
+    """
     from chronos_core.branching import ChronosBranchContext
     from chronos_core.workspace import ChronosWorkspaceContext
 
     errors: list[Exception] = []
+    # Passed only when enabled, so the default contexts open exactly as before.
+    schema_options: dict[str, Any] = {"enable_schema_branching": True} if schema_branching else {}
 
     def close(resource: Any) -> None:
         try:
@@ -310,10 +318,12 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
                 if not isinstance(database, DatabaseConfig):
                     continue
                 if database.metadata_url is None or database.metadata_url == database.database_url:
-                    context = ChronosBranchContext.connect(database.database_url)
+                    context = ChronosBranchContext.connect(
+                        database.database_url, **schema_options)
                     contexts[database.database_url] = context
                 else:
-                    context = ChronosBranchContext.connect_split(database.database_url, database.metadata_url)
+                    context = ChronosBranchContext.connect_split(
+                        database.database_url, database.metadata_url, **schema_options)
                 resources.callback(close, context)
                 if entry.merge_tables is not None:
                     context.set_merge_table_scope(list(entry.merge_tables))
@@ -347,9 +357,10 @@ def open_workspace(config: WorkspaceConfig) -> Generator[ChronosWorkspaceContext
 
                 target = config.filesystem
                 context = (
-                    ChronosBranchContext.connect_split(target.database_url, target.metadata_url)
+                    ChronosBranchContext.connect_split(
+                        target.database_url, target.metadata_url, **schema_options)
                     if target.metadata_url and target.metadata_url != target.database_url
-                    else ChronosBranchContext.connect(target.database_url)
+                    else ChronosBranchContext.connect(target.database_url, **schema_options)
                 )
                 try:
                     filesystem = ChronosFSStore(context)
