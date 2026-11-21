@@ -244,9 +244,13 @@ std::unique_ptr<SqlBranchSession> GatewayRuntime::checkout_postgres(
         ? std::make_unique<chronos::native::NativeBranchStore>(found->second.data_url)
         : std::make_unique<chronos::native::NativeBranchStore>(
               found->second.data_url, found->second.metadata_url);
+    // Read the move count before checking out, so a move that lands in
+    // between makes the session stale rather than going unnoticed.
+    const auto generation = branch_generation(grant.workspace, branch);
     auto session = store->checkout(branch);
     auto opened = std::make_unique<SqlBranchSession>(
         std::move(store), std::move(session), std::move(grant));
+    opened->branch_generation_ = generation;
     opened->set_schema_branching(target.config.schema_branching);
     opened->store_alias_ = store_alias;
     opened->startup_branch_ = branch;
@@ -329,6 +333,34 @@ void GatewayRuntime::recheck_postgres(
     const auto access = principals_.check(
         session.workspace(), *session.principal(), session.credential_version(), session.branch());
     session.set_read_only(access == BranchAccess::ReadOnly);
+}
+
+namespace {
+std::string branch_generation_key(const std::string &workspace, const std::string &branch) {
+    return workspace + '\n' + branch;
+}
+} // namespace
+
+std::uint64_t GatewayRuntime::branch_generation(const std::string &workspace, const std::string &branch) const {
+    std::lock_guard lock(branch_generations_mutex_);
+    const auto found = branch_generations_.find(branch_generation_key(workspace, branch));
+    return found == branch_generations_.end() ? 0 : found->second;
+}
+
+void GatewayRuntime::note_branch_moved(const std::string &workspace, const std::string &branch) {
+    std::lock_guard lock(branch_generations_mutex_);
+    ++branch_generations_[branch_generation_key(workspace, branch)];
+}
+
+std::unique_ptr<SqlBranchSession> GatewayRuntime::refresh_postgres(const SqlBranchSession &current) {
+    auto target = workspace(current.workspace());
+    auto opened = checkout_postgres(*target, current.store_alias(), current.branch(), current.access_grant());
+    opened->principal_ = current.principal_;
+    opened->credential_version_ = current.credential_version_;
+    opened->startup_branch_ = current.startup_branch_;
+    opened->read_only_ = current.read_only_;
+    if (!current.search_path().empty()) opened->set_search_path(current.search_path());
+    return opened;
 }
 
 std::unique_ptr<SqlBranchSession> GatewayRuntime::switch_postgres_branch(

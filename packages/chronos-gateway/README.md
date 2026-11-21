@@ -154,7 +154,7 @@ errors.
 | --- | --- | --- |
 | `GET .../branches` | `list_branches` (`branch list`) | `?store` for one store's records with metadata |
 | `PUT .../branches/{id}/metadata` | `update_branch_metadata` | `store`, `metadata` |
-| `POST .../branches/{id}/reset` | `reset_branch` (`branch reset`) | `checkpoint`; moves the branch back to it in place, keeping its name and metadata. Known limit: SQL connections already open on that branch keep reading its earlier state until they reconnect |
+| `POST .../branches/{id}/reset` | `reset_branch` (`branch reset`) | `checkpoint`; moves the branch back to it in place, keeping its name and metadata. SQL connections already open on that branch reopen at the reset state on their next statement; one inside a transaction gets SQLSTATE 40001 until it rolls back. Resets or keep-branch merges made outside this gateway (e.g. by the CLI) are not detected: reconnect after those |
 | `POST .../checkpoints` | `create_checkpoint` (201) | `name`, `branch` (default `main`), `metadata` |
 | `GET .../checkpoints` | `list_checkpoints` | `?store`, `?branch`, `?metadata_filter` (JSON) |
 | `GET .../diff` | `diff` | `?left`, `?right` |

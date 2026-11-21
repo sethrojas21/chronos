@@ -353,6 +353,25 @@ class ControlServer::Impl {
         }
     }
 
+    // A branch reset or a keep-branch merge moves a branch's head in place;
+    // open SQL sessions on it then reopen (see postgres_server.cpp).
+    void note_branch_moves(const std::string &workspace, const std::string &operation, const Json &arguments) {
+        const auto text = [&](const char *key) -> std::string {
+            const auto found = arguments.find(key);
+            return found != arguments.end() && found->is_string() ? found->get<std::string>() : std::string();
+        };
+        if (operation == "reset_branch" && !text("branch").empty()) {
+            runtime.note_branch_moved(workspace, text("branch"));
+            return;
+        }
+        if (operation == "merge_apply" || operation == "merge_atomic") {
+            const auto keep = arguments.find("keep_branch");
+            const bool kept = keep != arguments.end() &&
+                ((keep->is_boolean() && keep->get<bool>()) || (keep->is_string() && keep->get<std::string>() == "true"));
+            if (kept && !text("source").empty()) runtime.note_branch_moved(workspace, text("source"));
+        }
+    }
+
     // Versioning routes: each maps to one function of
     // chronos_core.control.operations, run in the embedded interpreter.
     std::optional<http::response<http::string_body>> versioning(
@@ -404,6 +423,7 @@ class ControlServer::Impl {
         arguments.update(query_arguments(query));
         arguments.update(path);
         const auto result = python.call(parts[2], operation, arguments.dump());
+        if (result.status >= 200 && result.status < 300) note_branch_moves(parts[2], operation, arguments);
         http::response<http::string_body> response(static_cast<http::status>(result.status), 11);
         response.set(http::field::content_type, "application/json");
         response.set(http::field::cache_control, "no-store");

@@ -114,6 +114,9 @@ class SqlBranchSession {
     // Writes are refused while true (a read-only branch of a principal).
     bool read_only() const { return read_only_; }
     void set_read_only(bool read_only) { read_only_ = read_only; }
+    // The runtime's move count for this branch when the session opened (see
+    // GatewayRuntime::branch_generation).
+    std::uint64_t branch_generation() const { return branch_generation_; }
 
   private:
     friend class GatewayRuntime;
@@ -129,6 +132,7 @@ class SqlBranchSession {
     std::uint64_t credential_version_ = 0;
     std::string startup_branch_;
     bool read_only_ = false;
+    std::uint64_t branch_generation_ = 0;
 };
 
 class GatewayRuntime {
@@ -180,6 +184,14 @@ class GatewayRuntime {
     std::unique_ptr<SqlBranchSession> switch_postgres_branch(
         const SqlBranchSession &current,
         const std::string &branch);
+    // How many times this gateway has moved the branch's head in place
+    // (branch reset, keep-branch merge). A session opened at an older count
+    // reads the branch's earlier state and must be reopened.
+    std::uint64_t branch_generation(const std::string &workspace, const std::string &branch) const;
+    void note_branch_moved(const std::string &workspace, const std::string &branch);
+    // The same branch reopened at its current state, keeping the session's
+    // login, permissions, and search_path.
+    std::unique_ptr<SqlBranchSession> refresh_postgres(const SqlBranchSession &current);
 
     chronos::native::NativeChronosFilesystem &authorize_filesystem(
         const std::string &export_id,
@@ -221,6 +233,8 @@ class GatewayRuntime {
     PrincipalRegistry principals_;
     mutable std::mutex workspaces_mutex_;
     std::unordered_map<std::string, std::shared_ptr<Workspace>> workspaces_;
+    mutable std::mutex branch_generations_mutex_;
+    std::unordered_map<std::string, std::uint64_t> branch_generations_;
 };
 
 } // namespace chronos::gateway

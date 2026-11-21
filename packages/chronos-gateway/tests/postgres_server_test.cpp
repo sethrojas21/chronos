@@ -299,6 +299,49 @@ void test_principals(GatewayRuntime &runtime, std::uint16_t port, const std::str
 
 } // namespace
 
+// A branch reset moves the branch's head in place. A connection that was
+// idle on that branch must read the reset state on its next statement, not
+// the state it opened on.
+void test_reset_reopens_idle_sessions(GatewayRuntime &runtime, std::uint16_t port,
+                                      const std::string &data, const std::string &metadata) {
+    CreateBranchRequest lasting;
+    lasting.workspace = "training";
+    lasting.from_branch = "main";
+    lasting.branch_id = "reset/1";
+    lasting.sandbox = false;
+    lasting.ttl = std::nullopt;
+    runtime.create_branch(lasting);
+    chronos::gateway::PrincipalSpec spec;
+    spec.name = "resetter";
+    spec.default_branch = "reset/1";
+    spec.branches = {"reset/1"};
+    auto issued = runtime.principals().create("training", spec);
+
+    auto agent = connect(port, "resetter", issued.password, "orders");
+    check(PQstatus(agent.get()) == CONNECTION_OK, PQerrorMessage(agent.get()));
+    expect_command(agent.get(),
+                   "INSERT INTO orders (id, customer_id, state, amount, note) VALUES (800, 10, 'kept', 1, NULL)",
+                   "INSERT 0 1", "a write before the checkpoint");
+    NativeBranchStore store(data, metadata);
+    store.create_checkpoint("reset-cp", "reset/1");
+    expect_command(agent.get(), "UPDATE orders SET state = 'later' WHERE id = 800", "UPDATE 1",
+                   "a write after the checkpoint");
+    expect_cell(agent.get(), "SELECT state FROM orders WHERE id = 800", 0, 0, "later", "the later write");
+
+    // Reset the branch while the connection stays open, as the reset route does.
+    store.reset_branch("reset/1", "reset-cp");
+    runtime.note_branch_moved("training", "reset/1");
+    expect_cell(agent.get(), "SELECT state FROM orders WHERE id = 800", 0, 0, "kept",
+                "an open connection reads the reset state after a reset");
+    expect_command(agent.get(), "UPDATE orders SET state = 'after reset' WHERE id = 800", "UPDATE 1",
+                   "writes continue on the reset branch");
+    {
+        auto fresh = connect(port, "resetter", issued.password, "orders");
+        expect_cell(fresh.get(), "SELECT state FROM orders WHERE id = 800", 0, 0, "after reset",
+                    "a new connection sees the same branch state");
+    }
+}
+
 int main() {
     TempDirectory temp;
     const char *postgres_data = std::getenv("CHRONOS_GATEWAY_TEST_POSTGRES_DATA_URL");
@@ -799,6 +842,7 @@ int main() {
     check(PQstatus(bad.get()) == CONNECTION_BAD, "wrong grant secret must fail authentication");
 
     test_principals(runtime, port, data, metadata, issued.access_grant->id, issued.database_credential);
+    test_reset_reopens_idle_sessions(runtime, port, data, metadata);
 
     runtime.close_branch("training", "rollout-wire");
     auto revoked = execute(connection.get(), "SELECT state FROM orders");

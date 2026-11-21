@@ -873,6 +873,25 @@ class PostgresServer::Impl {
                 branch_session = runtime.switch_postgres_branch(
                     *branch_session, branch ? *branch : branch_session->startup_branch());
             };
+            // Before each statement: if this gateway moved the branch's head
+            // (branch reset, keep-branch merge) since the session opened, the
+            // session still reads the earlier state. Outside a transaction it
+            // reopens at the current state; inside one the transaction must
+            // end first, so other statements fail with a retryable error.
+            const auto follow_branch_moves = [this, &branch_session](const std::string &keyword) {
+                if (runtime.branch_generation(branch_session->workspace(), branch_session->branch()) ==
+                    branch_session->branch_generation()) {
+                    return;
+                }
+                if (branch_session->session().in_transaction()) {
+                    if (keyword == "rollback" || keyword == "commit" || keyword == "end") return;
+                    throw SqlStateError(
+                        "branch \"" + branch_session->branch() +
+                            "\" was reset or continued while this transaction was open; roll back and retry",
+                        "40001");
+                }
+                branch_session = runtime.refresh_postgres(*branch_session);
+            };
 
             send_auth(socket, 0);
             send_parameter(socket, "server_version", "17.0-chronos");
@@ -916,6 +935,7 @@ class PostgresServer::Impl {
                     if (type == 'Q') {
                         std::size_t offset = 0;
                         const auto sql = take_cstring(payload, offset);
+                        follow_branch_moves(lower_keyword(sql));
                         auto execution = failed_transaction_reply(lower_keyword(sql));
                         if (!execution) execution = execute_sql(*branch_session, sql, {}, shared_ddl, switch_branch);
                         send_execution(socket, *execution, true);
@@ -970,11 +990,13 @@ class PostgresServer::Impl {
                         if (payload[0] == 'S') {
                             auto found = statements.find(name);
                             if (found == statements.end()) throw GatewayError("unknown prepared statement");
+                            follow_branch_moves(lower_keyword(found->second.sql));
                             send_statement_description(socket, *branch_session, found->second);
                         } else if (payload[0] == 'P') {
                             auto found = portals.find(name);
                             if (found == portals.end()) throw GatewayError("unknown portal");
                             const auto keyword = lower_keyword(found->second.sql);
+                            follow_branch_moves(keyword);
                             // A failed transaction runs nothing; Execute reports the error.
                             if (!failed_transaction &&
                                 (keyword == "select" || keyword == "with" || keyword == "show")) {
@@ -988,6 +1010,7 @@ class PostgresServer::Impl {
                         const auto portal_name = take_cstring(payload, offset);
                         auto found = portals.find(portal_name);
                         if (found == portals.end()) throw GatewayError("unknown portal");
+                        follow_branch_moves(lower_keyword(found->second.sql));
                         if (auto reply = failed_transaction_reply(lower_keyword(found->second.sql))) {
                             send_execution(socket, *reply, false);
                         } else if (found->second.described_result) {
