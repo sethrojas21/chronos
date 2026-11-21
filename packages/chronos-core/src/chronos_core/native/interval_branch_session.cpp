@@ -879,7 +879,7 @@ class NativeBranchSessionImpl {
             throw std::runtime_error("native INSERT does not support WITH or RETURNING");
         }
         NativeInsertPlan plan;
-        plan.table = relation_name(stmt->relation);
+        plan.table = dml_relation_name(stmt->relation);
         for (std::size_t i = 0; i < stmt->n_cols; ++i) {
             auto *node = stmt->cols[i];
             if (!node || node->node_case != PG_QUERY__NODE__NODE_RES_TARGET || !node->res_target->name) {
@@ -944,7 +944,7 @@ class NativeBranchSessionImpl {
             throw std::runtime_error("native UPDATE does not support WITH, FROM, or RETURNING");
         }
         NativeUpdatePlan plan;
-        plan.table = relation_name(stmt->relation);
+        plan.table = dml_relation_name(stmt->relation);
         plan.where = stmt->where_clause;
         for (std::size_t i = 0; i < stmt->n_target_list; ++i) {
             auto *node = stmt->target_list[i];
@@ -963,7 +963,7 @@ class NativeBranchSessionImpl {
         if (stmt->with_clause || stmt->n_using_clause > 0 || stmt->n_returning_list > 0) {
             throw std::runtime_error("native DELETE does not support WITH, USING, or RETURNING");
         }
-        return {relation_name(stmt->relation), stmt->where_clause};
+        return {dml_relation_name(stmt->relation), stmt->where_clause};
     }
 
     CachedNativeStatement cached_statement(const std::string &sql) {
@@ -2447,7 +2447,7 @@ class NativeBranchSessionImpl {
             !target_node->res_target->val) {
             throw std::runtime_error("native subquery must select one expression");
         }
-        NativeTableMeta meta = table_meta_for(relation_name(from_node->range_var));
+        NativeTableMeta meta = table_meta_for(dml_relation_name(from_node->range_var));
         QueryResult visible = select_visible_rows(meta, "", {}, meta.columns);
         SubqueryEvaluator evaluator = [this, &params](const PgQuery__SelectStmt *nested) {
             return this->evaluate_select_values(nested, params);

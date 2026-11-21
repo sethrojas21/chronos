@@ -3863,6 +3863,18 @@ std::string relation_name(const PgQuery__RangeVar *relation) {
     return relation->relname;
 }
 
+// The table a DML statement targets: "schema.table" when the statement names a
+// schema, as tables in a schema are registered under that qualified name.
+std::string dml_relation_name(const PgQuery__RangeVar *relation) {
+    if (!relation || !relation->relname || std::string(relation->relname).empty()) {
+        throw std::runtime_error("statement does not target a table");
+    }
+    if (relation->schemaname && std::string(relation->schemaname).size() > 0) {
+        return std::string(relation->schemaname) + "." + relation->relname;
+    }
+    return relation->relname;
+}
+
 std::string operator_name(const PgQuery__AExpr *expr) {
     if (!expr || expr->n_name == 0) throw std::runtime_error("expected operator expression");
     return node_string_value(expr->name[expr->n_name - 1]);
