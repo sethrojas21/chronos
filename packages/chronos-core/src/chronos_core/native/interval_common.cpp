@@ -603,6 +603,27 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
         const auto dot = table.rfind('.');
         out += " AS " + quote_ident(table.substr(dot == std::string::npos ? 0 : dot + 1));
     };
+    // The table part of a qualified name starting at `at` ('.' then a bare or
+    // double-quoted identifier): its name and the position after it.
+    auto qualified_tail = [&](std::size_t at) -> std::optional<std::pair<std::string, std::size_t>> {
+        if (at + 1 >= sql.size() || sql[at] != '.') return std::nullopt;
+        if (sql[at + 1] == '"') {
+            std::string name;
+            std::size_t k = at + 2;
+            while (k < sql.size()) {
+                if (sql[k] == '"') {
+                    if (k + 1 < sql.size() && sql[k + 1] == '"') { name.push_back('"'); k += 2; continue; }
+                    return std::make_pair(name, k + 1);
+                }
+                name.push_back(sql[k++]);
+            }
+            return std::nullopt;
+        }
+        if (!is_identifier_start(sql[at + 1])) return std::nullopt;
+        std::size_t k = at + 2;
+        while (k < sql.size() && is_identifier_part(sql[k])) ++k;
+        return std::make_pair(sql.substr(at + 1, k - at - 1), k);
+    };
     for (std::size_t i = 0; i < sql.size();) {
         const char ch = sql[i];
         if (ch == '\'' && !double_quote) {
@@ -627,7 +648,14 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
                 ++j;
             }
             if (expect_table && j < sql.size()) {
-                if (auto replacement = lookup_replacement(replacements, ident)) {
+                // "schema"."table" names the table registered as schema.table.
+                std::string lookup_name = ident;
+                std::size_t consumed = j + 1;
+                if (auto tail = qualified_tail(consumed)) {
+                    lookup_name = ident + "." + tail->first;
+                    consumed = tail->second;
+                }
+                if (auto replacement = lookup_replacement(replacements, lookup_name)) {
                     std::string ltrimmed = *replacement;
                     ltrimmed.erase(0, ltrimmed.find_first_not_of(" \n\r\t"));
                     std::string head = ltrimmed.substr(0, std::min<std::size_t>(6, ltrimmed.size()));
@@ -636,15 +664,15 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
                     });
                     if (head == "SELECT" || head.rfind("WITH", 0) == 0) {
                         out += "(" + *replacement + ")";
-                        append_implicit_alias(ident, j + 1);
+                        append_implicit_alias(lookup_name, consumed);
                     } else {
                         out += quote_ident(*replacement);
                     }
                 } else {
-                    out.append(sql, i, j - i + 1);
+                    out.append(sql, i, consumed - i);
                 }
                 expect_table = false;
-                i = j + 1;
+                i = consumed;
             } else {
                 out.append(sql, i, j < sql.size() ? j - i + 1 : j - i);
                 i = j < sql.size() ? j + 1 : j;
@@ -683,13 +711,9 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
         if (expect_table) {
             std::string lookup_name = ident;
             std::size_t consumed = j;
-            if (j < sql.size() && sql[j] == '.' && j + 1 < sql.size() && is_identifier_start(sql[j + 1])) {
-                std::size_t k = j + 2;
-                while (k < sql.size() && is_identifier_part(sql[k])) {
-                    ++k;
-                }
-                lookup_name = ident + "." + sql.substr(j + 1, k - j - 1);
-                consumed = k;
+            if (auto tail = qualified_tail(j)) {
+                lookup_name = ident + "." + tail->first;
+                consumed = tail->second;
             }
             if (auto replacement = lookup_replacement(replacements, lookup_name)) {
                 const std::string trimmed = replacement->substr(0, replacement->find_last_not_of(" \n\r\t") + 1);
@@ -706,7 +730,7 @@ std::string rewrite_visible_tables(const std::string &sql, const Replacements &r
                     out += quote_ident(*replacement);
                 }
             } else {
-                out += lookup_name;
+                out.append(sql, i, consumed - i);
             }
             expect_table = false;
             i = consumed;
