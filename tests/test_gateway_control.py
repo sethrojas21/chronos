@@ -116,6 +116,36 @@ def test_merges_call_operations_with_cli_defaults(control: GatewayControl, monke
     ]
 
 
+def test_keep_branch_is_passed_only_when_requested(control: GatewayControl, monkeypatch) -> None:
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def recorder(name: str):
+        def record(workspace: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append((name, args, kwargs))
+            return {}
+        return record
+
+    for name in ("merge_apply", "merge_atomic"):
+        monkeypatch.setattr(gateway_module.operations, name, recorder(name))
+
+    _call(control, "merge_apply", source="agent", target="main", keep_branch=True)
+    _call(control, "merge_apply", source="agent", target="main", keep_branch=False)
+    # Query parameters carry the flag as text.
+    _call(control, "merge_apply", source="agent", target="main", keep_branch="true")
+    _call(control, "merge_atomic", source="agent", target="main", operation_id="op-1", keep_branch=True)
+    assert _call(control, "merge_apply", source="agent", target="main", keep_branch="yes") == (
+        400, {"error": "keep_branch must be true or false"})
+    assert _call(control, "merge_preview", source="agent", target="main", keep_branch=True) == (
+        400, {"error": "unexpected arguments: keep_branch"})
+    assert calls == [
+        ("merge_apply", ("agent", "main", "abort_on_conflict"), {"keep_branch": True}),
+        ("merge_apply", ("agent", "main", "abort_on_conflict"), {}),
+        ("merge_apply", ("agent", "main", "abort_on_conflict"), {"keep_branch": True}),
+        ("merge_atomic", ("agent", "main"),
+         {"operation_id": "op-1", "preview_token": None, "policy": "abort_on_conflict", "keep_branch": True}),
+    ]
+
+
 def test_errors_are_redacted_and_internal_failures_are_500(tmp_path: Path, monkeypatch, capsys) -> None:
     secret = "postgresql://user:hunter2@db.internal/chronos_metadata"
     control = _control(tmp_path, metadata_url=f"sqlite:///{tmp_path / 'metadata.sqlite'}")
@@ -280,5 +310,45 @@ def test_shared_structure_schemas_and_search_path(postgres_url: str) -> None:
         assert ddl(sql='CREATE INDEX notes_body ON notes (body)', search_path=["ws2"]) == (
             200, {"tag": "CREATE INDEX", "created": True})
         assert not _call(control, "table_info", workspace="shared", store="app", table="notes")[1]["registered"]
+    finally:
+        control.close()
+
+
+def test_keep_branch_atomic_merge_lets_a_long_lived_branch_merge_again(tmp_path: Path) -> None:
+    # Merges need shared table structure (the native engine has no schema-branching merge).
+    control = _shared_control(tmp_path)
+    try:
+        call = partial(_call, control, workspace="shared")
+        assert call("apply_ddl", store="app", sql="CREATE TABLE orders (id INTEGER PRIMARY KEY, state TEXT)")[0] == 200
+        workspace = control._open(control._workspaces["shared"])
+        app = workspace.stores["app"]
+        app.checkout("main").execute("INSERT INTO orders (id, state) VALUES (1, 'new')")
+        workspace.create_branch("agent")
+        state = lambda branch: app.checkout(branch).query("SELECT state FROM orders")[0]["state"]  # noqa: E731
+        set_state = lambda branch, value: app.checkout(branch).execute(  # noqa: E731
+            "UPDATE orders SET state = :state WHERE id = 1", {"state": value})
+
+        set_state("agent", "paid")
+        status, result = call("merge_atomic", source="agent", target="main", operation_id="m1", keep_branch=True)
+        assert status == 200 and (result["status"], result["selected"]) == ("committed", 1), result
+        assert state("main") == "paid"
+        # The branch continues from the merged main: syncing back changes nothing ...
+        status, result = call("merge_atomic", source="main", target="agent", operation_id="sync")
+        assert status == 200 and (result["status"], result["selected"]) == ("noop", 0), result
+        # ... and its next change merges without a conflict.
+        set_state("agent", "shipped")
+        status, result = call("merge_atomic", source="agent", target="main", operation_id="m2", keep_branch=True)
+        assert status == 200 and (result["status"], result["selected"]) == ("committed", 1), result
+        assert state("main") == "shipped"
+
+        # Without keep_branch the merge is unchanged: the fork point stays the
+        # base, so the second merge conflicts.
+        workspace.create_branch("plain")
+        set_state("plain", "a")
+        assert call("merge_atomic", source="plain", target="main", operation_id="p1")[1]["status"] == "committed"
+        set_state("main", "b")
+        set_state("plain", "c")
+        status, body = call("merge_atomic", source="plain", target="main", operation_id="p2")
+        assert status == 400 and "conflict" in body["error"], body
     finally:
         control.close()

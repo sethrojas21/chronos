@@ -77,6 +77,18 @@ def _names(args: dict[str, Any], name: str) -> list[str]:
     return value
 
 
+def _flag(args: dict[str, Any], name: str) -> bool:
+    value = args.get(name)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        # Query parameters carry booleans as text.
+        value = {"true": True, "false": False}.get(value, value)
+    if not isinstance(value, bool):
+        raise ControlError(400, f"{name} must be true or false")
+    return value
+
+
 def _policy(args: dict[str, Any]) -> str | None:
     value = _text(args, "policy", required=False, default="abort_on_conflict")
     if value not in _POLICIES:
@@ -183,11 +195,19 @@ def _merge(name: str) -> Callable[[WorkspaceConfig, dict[str, Any]], Call]:
     return parse
 
 
+def _merge_apply(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
+    source, target, policy = _text(a, "source"), _text(a, "target"), _policy(a)
+    if _flag(a, "keep_branch"):
+        return lambda ws: operations.merge_apply(ws, source, target, policy, keep_branch=True)
+    return lambda ws: operations.merge_apply(ws, source, target, policy)
+
+
 def _merge_atomic(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     source, target, policy = _text(a, "source"), _text(a, "target"), _policy(a)
     operation_id, preview_token = _text(a, "operation_id"), _text(a, "preview_token", required=False)
+    options = {"keep_branch": True} if _flag(a, "keep_branch") else {}
     return lambda ws: operations.merge_atomic(
-        ws, source, target, operation_id=operation_id, preview_token=preview_token, policy=policy)
+        ws, source, target, operation_id=operation_id, preview_token=preview_token, policy=policy, **options)
 
 
 def _register_table(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
@@ -232,10 +252,11 @@ _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[st
     "list_checkpoints": (_list_checkpoints, frozenset({"store", "branch", "metadata_filter"}), 200, False),
     "diff": (_diff, frozenset({"left", "right"}), 200, True),
     "merge_preview": (_merge("merge_preview"), frozenset({"source", "target", "policy"}), 200, True),
-    "merge_apply": (_merge("merge_apply"), frozenset({"source", "target", "policy"}), 200, True),
+    "merge_apply": (_merge_apply, frozenset({"source", "target", "policy", "keep_branch"}), 200, True),
     "merge_atomic_preview": (_merge("merge_atomic_preview"), frozenset({"source", "target", "policy"}), 200, True),
     "merge_atomic": (
-        _merge_atomic, frozenset({"source", "target", "policy", "operation_id", "preview_token"}), 200, True),
+        _merge_atomic, frozenset({"source", "target", "policy", "operation_id", "preview_token", "keep_branch"}),
+        200, True),
     "register_table": (_register_table, frozenset({"store", "table", "primary_key", "create_sql"}), 201, False),
     "table_info": (_table_info, frozenset({"store", "table"}), 200, False),
     "create_index": (_create_index, frozenset({"store", "table", "columns", "name"}), 201, False),

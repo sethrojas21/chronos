@@ -132,6 +132,11 @@ void check_versioning_routes(std::uint16_t port) {
     check(merge.result() == http::status::bad_request &&
               body_of(merge).at("error") == "operation_id is required",
           "atomic apply requires an operation id: " + merge.body());
+    auto kept = request(port, http::verb::post, base + "/merges/atomic-apply",
+                        {{"source", "a"}, {"target", "main"}, {"operation_id", "op"}, {"keep_branch", "yes"}});
+    check(kept.result() == http::status::bad_request &&
+              body_of(kept).at("error") == "keep_branch must be true or false",
+          "atomic apply passes keep_branch through: " + kept.body());
     check(request(port, http::verb::post, base + "/merges/sideways", {{"source", "a"}}).result() ==
               http::status::not_found,
           "unknown merge routes are not found");

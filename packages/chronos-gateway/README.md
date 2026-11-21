@@ -74,15 +74,17 @@ errors.
 | `GET .../checkpoints` | `list_checkpoints` | `?store`, `?branch`, `?metadata_filter` (JSON) |
 | `GET .../diff` | `diff` | `?left`, `?right` |
 | `POST .../merges/preview` | `merge_preview` | `source`, `target`, `policy` |
-| `POST .../merges/apply` | `merge_apply` | `source`, `target`, `policy` |
+| `POST .../merges/apply` | `merge_apply` | `source`, `target`, `policy`, `keep_branch` |
 | `POST .../merges/atomic-preview` | `merge_atomic_preview` | `source`, `target`, `policy` |
-| `POST .../merges/atomic-apply` | `merge_atomic` | `source`, `target`, `operation_id`, `preview_token`, `policy` |
+| `POST .../merges/atomic-apply` | `merge_atomic` | `source`, `target`, `operation_id`, `preview_token`, `policy`, `keep_branch` |
 | `POST .../tables` | `register_table` (201) | `store`, `table`, `primary_key`, optional `create_sql` (a CREATE TABLE run first, as `table create`) |
 | `GET .../tables/{table}` | `table_info` | `?store` |
 | `POST .../tables/{table}/indexes` | `create_index` (201) | `store`, `columns`, `name` |
 
 `.../` is `/v1/workspaces/{workspace}/`. `policy` is `abort_on_conflict` (the
-default, as in the CLI), `snapshot_isolation`, or `api-default`. Each workspace
+default, as in the CLI), `snapshot_isolation`, or `api-default`. `keep_branch`
+(default `false`, as `--keep-branch` in the CLI) continues the source from the
+merged target, so a long-lived branch can merge into it again. Each workspace
 opens on its first versioning request, with the table structure mode of its
 configuration (below), and stays open; its requests run one at a time.
 

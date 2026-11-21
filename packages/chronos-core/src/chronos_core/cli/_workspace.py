@@ -343,6 +343,11 @@ def diff(ctx: typer.Context, left: str, right: str) -> None:
         print_result(operations.diff(workspace, left, right))
 
 
+KEEP_BRANCH_HELP = (
+    "After the merge, continue SOURCE from the merged TARGET so it can keep working and merge again."
+)
+
+
 @merge_app.command("preview")
 def merge_preview(ctx: typer.Context, source: str, target: str,
                   policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
@@ -352,9 +357,10 @@ def merge_preview(ctx: typer.Context, source: str, target: str,
 
 @merge_app.command("apply")
 def merge_apply(ctx: typer.Context, source: str, target: str,
-                policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy")) -> None:
+                policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy"),
+                keep_branch: bool = typer.Option(False, "--keep-branch", help=KEEP_BRANCH_HELP)) -> None:
     with connect_workspace(ctx) as workspace:
-        print_result(operations.merge_apply(workspace, source, target, policy.api_value))
+        print_result(operations.merge_apply(workspace, source, target, policy.api_value, keep_branch))
 
 
 @merge_app.command("atomic-preview")
@@ -370,11 +376,12 @@ def merge_atomic(
     operation_id: str = typer.Option(..., "--operation-id"),
     preview_token: str | None = typer.Option(None, "--preview-token"),
     policy: MergePolicy = typer.Option(MergePolicy.abort_on_conflict, "--policy"),
+    keep_branch: bool = typer.Option(False, "--keep-branch", help=KEEP_BRANCH_HELP),
 ) -> None:
     with connect_workspace(ctx) as workspace:
         print_result(operations.merge_atomic(
             workspace, source, target, operation_id=operation_id, preview_token=preview_token,
-            policy=policy.api_value,
+            policy=policy.api_value, keep_branch=keep_branch,
         ))
 
 

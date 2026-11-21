@@ -425,6 +425,11 @@ class TestWorkspaceCommands:
         (["merge", "atomic-preview", "trial", "main"], "merge_atomic_preview", ("trial", "main"), {"policy": "abort_on_conflict"}),
         (["merge", "atomic-apply", "trial", "main", "--operation-id", "merge-1", "--preview-token", "reviewed"],
          "merge_atomic", ("trial", "main"), {"policy": "abort_on_conflict", "operation_id": "merge-1", "preview_token": "reviewed"}),
+        (["merge", "apply", "trial", "main", "--keep-branch"], "merge_apply", ("trial", "main"),
+         {"policy": "abort_on_conflict", "keep_branch": True}),
+        (["merge", "atomic-apply", "trial", "main", "--operation-id", "merge-1", "--keep-branch"],
+         "merge_atomic", ("trial", "main"),
+         {"policy": "abort_on_conflict", "operation_id": "merge-1", "preview_token": None, "keep_branch": True}),
     ])
     def test_workspace_forwarding(self, workspace_connection: MagicMock, args, method, expected_args, expected_kwargs) -> None:
         result = runner.invoke(app, [*args])

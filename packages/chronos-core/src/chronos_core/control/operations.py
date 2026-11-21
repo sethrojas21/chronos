@@ -54,7 +54,11 @@ def merge_preview(workspace: ChronosWorkspaceContext, source: str, target: str, 
     return workspace.merge_preview(source, target, policy=policy)
 
 
-def merge_apply(workspace: ChronosWorkspaceContext, source: str, target: str, policy: str | None) -> Any:
+def merge_apply(workspace: ChronosWorkspaceContext, source: str, target: str, policy: str | None,
+                keep_branch: bool = False) -> Any:
+    """Merge source into target; keep_branch then continues source from the merged target."""
+    if keep_branch:
+        return workspace.merge_apply(source, target, policy=policy, keep_branch=True)
     return workspace.merge_apply(source, target, policy=policy)
 
 
@@ -64,9 +68,12 @@ def merge_atomic_preview(workspace: ChronosWorkspaceContext, source: str, target
 
 
 def merge_atomic(workspace: ChronosWorkspaceContext, source: str, target: str, *, operation_id: str,
-                 preview_token: str | None = None, policy: str | None = None) -> Any:
+                 preview_token: str | None = None, policy: str | None = None,
+                 keep_branch: bool = False) -> Any:
+    """Merge source into target atomically; keep_branch then continues source from the merged target."""
+    options: dict[str, Any] = {"keep_branch": True} if keep_branch else {}
     return workspace.merge_atomic(
-        source, target, operation_id=operation_id, preview_token=preview_token, policy=policy,
+        source, target, operation_id=operation_id, preview_token=preview_token, policy=policy, **options,
     )
 
 

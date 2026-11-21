@@ -88,6 +88,23 @@ scope for each store. See the atomic SQL example below. Use
 split-data workspaces because the Python API's diff does not use merge scopes.
 See the filesystem sections below for OverlayFS and native ChronosFS setup.
 
+### Long-lived branches that merge repeatedly
+
+`merge apply` and `merge atomic-apply` accept `--keep-branch`. After the merge,
+the source branch continues from the merged target, keeping its name: it then
+reads what the target holds, syncing the target back into it applies nothing,
+and its next changes merge into the target again without conflicting with the
+ones already merged. Without the option a merge behaves as before: the source
+keeps its fork point as the merge base.
+
+```sh
+chronos branch create agent
+chronos execute "UPDATE items SET v = 2 WHERE id = 1" --store app --branch agent
+chronos merge apply agent main --keep-branch
+chronos execute "UPDATE items SET v = 3 WHERE id = 1" --store app --branch agent
+chronos merge apply agent main --keep-branch   # merges cleanly again
+```
+
 ## Checked terminal demo
 
 After installation, run `bash examples/cli_workspace_demo.sh --help` from the

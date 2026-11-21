@@ -572,6 +572,48 @@ class TestWorkspaceSQLWorkflows:
         _invoke_workspace(config, "branch", "delete", "experiment")
         assert _invoke_workspace(config, "branch", "list") == ["main"]
 
+    @pytest.mark.parametrize("atomic", [False, True], ids=["coordinated", "atomic"])
+    def test_keep_branch_merge_for_a_long_lived_agent_branch(
+        self, cli_database: DatabaseConfig, tmp_path: Path, atomic: bool,
+    ) -> None:
+        config = _workspace_config_file(tmp_path, cli_database, atomic=atomic)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, v INTEGER)", "--store", "app")
+        invoke("table", "register", "items", "--primary-key", "id", "--store", "app")
+        invoke("execute", "INSERT INTO items (id, v) VALUES (1, 1)", "--store", "app")
+        set_v = lambda branch, value: invoke(  # noqa: E731
+            "execute", f"UPDATE items SET v = {value} WHERE id = 1", "--store", "app", "--branch", branch)
+        value = lambda branch: invoke(  # noqa: E731
+            "query", "SELECT v FROM items", "--store", "app", "--branch", branch)[0]["v"]
+
+        def merge(source: str, target: str, *options: str, ok: bool = True) -> int | None:
+            if atomic:
+                result = invoke("merge", "atomic-apply", source, target, "--operation-id", f"{source}-{target}-{uuid4()}",
+                                *options, ok=ok)
+                return None if result is None else result["selected"]
+            result = invoke("merge", "apply", source, target, *options, ok=ok)
+            return None if result is None else result["app"]["applied"]
+
+        invoke("branch", "create", "agent")
+        set_v("agent", 2)
+        assert merge("agent", "main", "--keep-branch") == 1
+        assert value("main") == 2 and value("agent") == 2
+        # The agent branch continues from the merged main: syncing back is a no-op ...
+        assert merge("main", "agent") == 0
+        # ... and its next change merges again without a conflict.
+        set_v("agent", 3)
+        assert merge("agent", "main", "--keep-branch") == 1
+        assert value("main") == 3
+
+        # Without --keep-branch a merge behaves as before: the fork point stays
+        # the base, so the branch's second merge conflicts.
+        invoke("branch", "create", "plain")
+        set_v("plain", 4)
+        assert merge("plain", "main") == 1
+        set_v("plain", 5)
+        assert merge("plain", "main", ok=False) is None
+        assert value("main") == 4
+
     def test_relational_sql_inputs_and_rollback(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)
