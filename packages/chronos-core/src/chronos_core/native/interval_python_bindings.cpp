@@ -712,6 +712,18 @@ void NativeBranchStore::create_branch_from_checkpoint(
     impl_->create_branch_from_checkpoint(branch_id, checkpoint);
 }
 
+void NativeBranchStore::continue_branch_from(
+    const std::string &branch_id,
+    const std::string &onto,
+    int child_width
+) {
+    impl_->continue_branch_from(branch_id, onto, child_width);
+}
+
+void NativeBranchStore::reset_branch(const std::string &branch_id, const std::string &checkpoint) {
+    impl_->reset_branch(branch_id, checkpoint);
+}
+
 void NativeBranchStore::delete_branch(const std::string &branch_id) {
     impl_->delete_branch(branch_id);
 }
@@ -1319,6 +1331,21 @@ void bind_interval_data_plane(py::module_ &m) {
         .def(
             "create_branch_from_checkpoint",
             &NativeBranchStore::create_branch_from_checkpoint,
+            py::arg("branch_id"),
+            py::arg("checkpoint"),
+            py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "continue_branch_from",
+            &NativeBranchStore::continue_branch_from,
+            py::arg("branch_id"),
+            py::arg("onto"),
+            py::arg("child_width") = 0,
+            py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "reset_branch",
+            &NativeBranchStore::reset_branch,
             py::arg("branch_id"),
             py::arg("checkpoint"),
             py::call_guard<py::gil_scoped_release>()

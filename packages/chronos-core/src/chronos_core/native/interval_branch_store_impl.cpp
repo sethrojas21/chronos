@@ -1617,13 +1617,59 @@
         }
     }
 
+    // replace_segment: instead of creating branch_id, move the existing
+    // branch's head (expected at that segment) to the new child of
+    // from_branch, so the branch continues from from_branch's current state.
+    // The branch's current head segment and kind, for the replace mode.
+    std::pair<std::int64_t, std::string> branch_head(const std::string &branch_id) {
+        auto rows = driver_->query(
+            "SELECT current_segment_id, branch_kind FROM _chronos_branch_interval_branches WHERE branch_id = ?",
+            {branch_id}
+        );
+        if (rows.empty()) throw std::runtime_error("branch not found: " + branch_id);
+        return {native_as_int(rows[0][0]), native_as_string(rows[0][1])};
+    }
+
+    // Continue an existing branch from onto's current state, keeping its name
+    // and metadata, as if it had just been created from onto. Used after a
+    // merge into onto so the branch can keep working and merge again.
+    void continue_branch_from(const std::string &branch_id, const std::string &onto, int child_width) {
+        if (branch_id == onto) throw std::runtime_error("a branch cannot continue from itself: " + branch_id);
+        NativeSessionBarrierGuard guard = begin_session_barrier({onto, branch_id}, "fork");
+        try {
+            auto [head, kind] = branch_head(branch_id);
+            if (kind == "terminal") throw std::runtime_error("terminal branch cannot continue: " + branch_id);
+            create_branch_unfenced(branch_id, onto, false, "{}", 0, child_width, head);
+            finish_session_barrier(guard);
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
+    // Move an existing branch back to a checkpoint, keeping its name and
+    // metadata. Later work on the branch continues from the checkpoint.
+    void reset_branch(const std::string &branch_id, const std::string &checkpoint) {
+        NativeSessionBarrierGuard guard = begin_session_barrier({branch_id}, "fork");
+        try {
+            auto [head, kind] = branch_head(branch_id);
+            if (kind == "terminal") throw std::runtime_error("terminal branch cannot be reset: " + branch_id);
+            create_branch_from_checkpoint(branch_id, checkpoint, head);
+            finish_session_barrier(guard);
+        } catch (...) {
+            abort_session_barrier(guard);
+            throw;
+        }
+    }
+
     void create_branch_unfenced(
         const std::string &branch_id,
         const std::string &from_branch,
         bool terminal,
         const std::string &metadata_json,
         int fanout,
-        int child_width
+        int child_width,
+        std::optional<std::int64_t> replace_segment = std::nullopt
     ) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1657,7 +1703,7 @@
             if (source_rows.empty()) {
                 throw std::runtime_error("branch not found: " + from_branch);
             }
-            if (native_as_int(source_rows[0][3]) > 0) {
+            if (!replace_segment && native_as_int(source_rows[0][3]) > 0) {
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
             children_created = static_cast<int>(native_as_int(source_rows[0][2]));
@@ -1681,7 +1727,7 @@
                 "SELECT 1 FROM _chronos_branch_interval_branches WHERE branch_id = ? LIMIT 1",
                 {branch_id}
             );
-            if (!existing.empty()) {
+            if (!replace_segment && !existing.empty()) {
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
             source_rows = driver_->query(
@@ -1766,27 +1812,43 @@
                 "SET current_segment_id = ?, child_count = child_count + 1 "
                 "WHERE branch_id = ? AND current_segment_id = ? "
                 "RETURNING 1"
-                "), inserted_branch AS ("
-                "INSERT INTO _chronos_branch_interval_branches "
-                "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
-                "SELECT ?, ?, ?, 0, ?, ?, ? WHERE EXISTS (SELECT 1 FROM updated_parent) "
-                "RETURNING 1"
+                "), inserted_branch AS (" + std::string(replace_segment
+                    // The existing branch moves to the new child, if its head
+                    // is still where the caller saw it.
+                    ? "UPDATE _chronos_branch_interval_branches "
+                      "SET current_segment_id = ?, parent_branch_id = ? "
+                      "WHERE branch_id = ? AND current_segment_id = ? "
+                      "AND EXISTS (SELECT 1 FROM updated_parent) "
+                      "RETURNING 1"
+                    : "INSERT INTO _chronos_branch_interval_branches "
+                      "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
+                      "SELECT ?, ?, ?, 0, ?, ?, ? WHERE EXISTS (SELECT 1 FROM updated_parent) "
+                      "RETURNING 1") +
                 ") SELECT "
                 "(SELECT COUNT(*) FROM updated_parent), "
                 "(SELECT COUNT(*) FROM inserted_branch)",
-                {
-                    fork_base_id, source_segment.segment_id, std::monostate{},
-                    cpp_int_to_decimal(lo), cpp_int_to_decimal(fork_base_hi), cpp_int_to_decimal(lo), now,
-                    continuation_id, fork_base_id, from_branch,
-                    cpp_int_to_decimal(child_hi), cpp_int_to_decimal(hi), cpp_int_to_decimal(child_hi), now,
-                    child_id, fork_base_id, branch_id,
-                    cpp_int_to_decimal(fork_base_hi), cpp_int_to_decimal(child_hi), cpp_int_to_decimal(child_branch_point), now,
-                    continuation_id, from_branch, source_segment.segment_id,
-                    branch_id, child_id, from_branch,
-                    terminal ? std::string("terminal") : std::string("mutable"),
-                    now,
-                    metadata_json.empty() ? std::string("{}") : metadata_json,
-                }
+                [&] {
+                    std::vector<Value> params{
+                        fork_base_id, source_segment.segment_id, std::monostate{},
+                        cpp_int_to_decimal(lo), cpp_int_to_decimal(fork_base_hi), cpp_int_to_decimal(lo), now,
+                        continuation_id, fork_base_id, from_branch,
+                        cpp_int_to_decimal(child_hi), cpp_int_to_decimal(hi), cpp_int_to_decimal(child_hi), now,
+                        child_id, fork_base_id, branch_id,
+                        cpp_int_to_decimal(fork_base_hi), cpp_int_to_decimal(child_hi), cpp_int_to_decimal(child_branch_point), now,
+                        continuation_id, from_branch, source_segment.segment_id,
+                    };
+                    if (replace_segment) {
+                        params.insert(params.end(), {child_id, from_branch, branch_id, *replace_segment});
+                    } else {
+                        params.insert(params.end(), {
+                            branch_id, child_id, from_branch,
+                            terminal ? std::string("terminal") : std::string("mutable"),
+                            now,
+                            metadata_json.empty() ? std::string("{}") : metadata_json,
+                        });
+                    }
+                    return params;
+                }()
             );
             if (rows.empty() || native_as_int(rows[0][0]) != 1 || native_as_int(rows[0][1]) != 1) {
                 throw std::runtime_error("branch head changed during native branch creation: " + from_branch);
@@ -1817,12 +1879,24 @@
             if (updated != 1) {
                 throw std::runtime_error("branch head changed during native branch creation: " + from_branch);
             }
-            driver_->execute(
-                "INSERT INTO _chronos_branch_interval_branches "
-                "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
-                "VALUES (?, ?, ?, 0, ?, ?, ?)",
-                {branch_id, child_id, from_branch, terminal ? std::string("terminal") : std::string("mutable"), now, metadata_json.empty() ? std::string("{}") : metadata_json}
-            );
+            if (replace_segment) {
+                const std::int64_t moved = driver_->execute_changes(
+                    "UPDATE _chronos_branch_interval_branches "
+                    "SET current_segment_id = ?, parent_branch_id = ? "
+                    "WHERE branch_id = ? AND current_segment_id = ?",
+                    {child_id, from_branch, branch_id, *replace_segment}
+                );
+                if (moved != 1) {
+                    throw std::runtime_error("branch head changed during native branch continuation: " + branch_id);
+                }
+            } else {
+                driver_->execute(
+                    "INSERT INTO _chronos_branch_interval_branches "
+                    "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
+                    "VALUES (?, ?, ?, 0, ?, ?, ?)",
+                    {branch_id, child_id, from_branch, terminal ? std::string("terminal") : std::string("mutable"), now, metadata_json.empty() ? std::string("{}") : metadata_json}
+                );
+            }
         }
         if (started_tx) driver_->execute("COMMIT");
         } catch (...) {
@@ -1836,9 +1910,13 @@
         }
     }
 
+    // replace_segment: instead of creating branch_id, move the existing
+    // branch's head (expected at that segment) to a new child of the
+    // checkpoint, keeping its name and metadata.
     void create_branch_from_checkpoint(
         const std::string &branch_id,
-        const std::string &checkpoint
+        const std::string &checkpoint,
+        std::optional<std::int64_t> replace_segment = std::nullopt
     ) {
         const bool started_tx = !driver_->in_transaction();
         if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
@@ -1847,7 +1925,7 @@
                 "SELECT 1 FROM _chronos_branch_interval_branches WHERE branch_id = ? LIMIT 1",
                 {branch_id}
             );
-            if (!existing.empty()) {
+            if (!replace_segment && !existing.empty()) {
                 throw std::runtime_error("branch already exists: " + branch_id);
             }
             // Serialize reservations per checkpoint on PostgreSQL. SQLite's
@@ -1920,12 +1998,24 @@
                     now,
                 }
             );
-            driver_->execute(
-                "INSERT INTO _chronos_branch_interval_branches "
-                "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
-                "VALUES (?, ?, ?, 0, 'mutable', ?, '{}')",
-                {branch_id, child_segment_id, parent_branch_id, now}
-            );
+            if (replace_segment) {
+                const std::int64_t moved = driver_->execute_changes(
+                    "UPDATE _chronos_branch_interval_branches "
+                    "SET current_segment_id = ?, parent_branch_id = ? "
+                    "WHERE branch_id = ? AND current_segment_id = ?",
+                    {child_segment_id, parent_branch_id, branch_id, *replace_segment}
+                );
+                if (moved != 1) {
+                    throw std::runtime_error("branch head changed during native branch reset: " + branch_id);
+                }
+            } else {
+                driver_->execute(
+                    "INSERT INTO _chronos_branch_interval_branches "
+                    "(branch_id, current_segment_id, parent_branch_id, child_count, branch_kind, created_at, metadata) "
+                    "VALUES (?, ?, ?, 0, 'mutable', ?, '{}')",
+                    {branch_id, child_segment_id, parent_branch_id, now}
+                );
+            }
             driver_->execute(
                 "UPDATE _chronos_branch_interval_branches "
                 "SET child_count = child_count + 1 "

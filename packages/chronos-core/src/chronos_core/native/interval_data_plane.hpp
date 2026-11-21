@@ -158,6 +158,11 @@ class NativeBranchStore {
         const std::string &branch_id,
         const std::string &checkpoint
     );
+    // Continue an existing branch from onto's current state, keeping its name
+    // and metadata (after a merge into onto, so it can merge again).
+    void continue_branch_from(const std::string &branch_id, const std::string &onto, int child_width = 0);
+    // Move an existing branch back to a checkpoint, keeping its name.
+    void reset_branch(const std::string &branch_id, const std::string &checkpoint);
     void delete_branch(const std::string &branch_id);
     NativeBranchInfo update_branch_metadata(
         const std::string &branch_id,
