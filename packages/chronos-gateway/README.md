@@ -195,7 +195,7 @@ Each workspace chooses how table structure is versioned with
   Chronos index; a partial index (`WHERE`) becomes a plain index on the same
   columns. These run outside the client's transaction: the table or index
   exists on every branch as soon as the statement returns, and `ROLLBACK` does
-  not remove it. Other DDL (`ALTER`, `DROP`, unique or expression indexes,
+  not remove it. `UNIQUE` in `CREATE TABLE` is accepted as a lookup index on the same columns, named per schema like other indexes, but it is **not enforced**: a branch can hold duplicate values and merges don't check them. Other DDL (`ALTER`, `DROP`, unique or expression indexes,
   tables without a primary key, PostgreSQL schemas) is refused with SQLSTATE
   `0A000`. The translation is `chronos_core.control.ddl`.
 

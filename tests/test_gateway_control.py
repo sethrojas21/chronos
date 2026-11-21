@@ -373,3 +373,29 @@ def test_keep_branch_atomic_merge_lets_a_long_lived_branch_merge_again(tmp_path:
         assert status == 400 and "conflict" in body["error"], body
     finally:
         control.close()
+
+
+def test_shared_structure_unique_becomes_a_per_schema_index(postgres_url: str) -> None:
+    """UNIQUE is accepted as a lookup index, named per schema, and not enforced."""
+    workspace = {"schema_branching": False, "stores": {"app": {"data_url": postgres_url}}}
+    control = GatewayControl(json.dumps({"workspaces": {"shared": workspace}}))
+    try:
+        ddl = partial(_call, control, "apply_ddl", workspace="shared", store="app")
+        create = ('CREATE TABLE "agent-skill" ("objectId" TEXT COLLATE "C" NOT NULL, '
+                  '"slug" TEXT COLLATE "C" UNIQUE, "version" TEXT, PRIMARY KEY ("objectId"))')
+        for schema in ("ws_a", "ws_b"):  # the same table in two schemas must not collide
+            assert ddl(sql=f'CREATE SCHEMA "{schema}"')[0] == 200
+            assert ddl(sql=create, search_path=[schema]) == (200, {"tag": "CREATE TABLE", "created": True})
+            status, info = _call(control, "table_info", workspace="shared", store="app", table=f"{schema}.agent-skill")
+            assert status == 200 and [(i["name"], i["columns"]) for i in info["indexes"]] == [
+                (f"{schema}.agent-skill_slug_key", ["slug"])]
+        assert ddl(sql="CREATE TABLE pairs (id TEXT PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))")[0] == 200
+        _, info = _call(control, "table_info", workspace="shared", store="app", table="pairs")
+        assert [(i["name"], i["columns"]) for i in info["indexes"]] == [("pairs_a_b_key", ["a", "b"])]
+
+        # Documented: not enforced on the versioned rows.
+        session = control._open(control._workspaces["shared"]).stores["app"].checkout("main")
+        session.upsert_rows("ws_a.agent-skill", [{"objectId": "1", "slug": "same"}, {"objectId": "2", "slug": "same"}])
+        assert len(session.query('SELECT "objectId" FROM ws_a."agent-skill"')) == 2
+    finally:
+        control.close()

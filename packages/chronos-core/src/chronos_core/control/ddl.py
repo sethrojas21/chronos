@@ -10,6 +10,10 @@ issuing ordinary DDL.
 These calls are not part of the client's transaction: the table or index
 exists on every branch as soon as the statement returns, and a rollback does
 not remove it.
+
+UNIQUE in CREATE TABLE is accepted as a lookup index on the same columns but
+is NOT enforced: a branch can hold duplicate values, and merges do not check
+them. Enforcing it per branch would be an engine feature.
 """
 from __future__ import annotations
 
@@ -36,6 +40,9 @@ class CreateTable:
     primary_key: tuple[str, ...]
     if_not_exists: bool
     sql: str
+    # Column sets declared UNIQUE. They become plain Chronos indexes; the
+    # constraint is not enforced on versioned rows (see apply_shared_ddl).
+    unique_columns: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,23 @@ def parse_shared_ddl(sql: str, search_path: list[str] | None = None) -> CreateTa
         if current is not None and not schema.this.args.get("db"):
             schema.this.set("db", exp.to_identifier(current, quoted=True))
             sql = statement.sql(dialect="postgres")
+        # UNIQUE is removed from the table PostgreSQL creates: its automatic
+        # index would be adopted at registration under a name that is not
+        # per schema, and it would not constrain the versioned rows anyway.
+        unique_columns: list[tuple[str, ...]] = []
+        for item in list(schema.expressions):
+            if isinstance(item, exp.ColumnDef):
+                for constraint in list(item.constraints):
+                    if isinstance(constraint.kind, exp.UniqueColumnConstraint):
+                        unique_columns.append((item.name,))
+                        constraint.pop()
+            elif isinstance(item, exp.UniqueColumnConstraint):
+                columns = item.this.expressions if isinstance(item.this, exp.Schema) else []
+                if columns:
+                    unique_columns.append(tuple(column.name for column in columns))
+                item.pop()
+        if unique_columns:
+            sql = statement.sql(dialect="postgres")
         table = _table_name(schema.this)
         primary_key: list[str] = []
         for item in schema.expressions:
@@ -95,7 +119,8 @@ def parse_shared_ddl(sql: str, search_path: list[str] | None = None) -> CreateTa
                 primary_key.extend(column.name for column in item.expressions)
         if not primary_key:
             raise SharedDDLError(f"table {table!r} needs a primary key to be versioned by Chronos")
-        return CreateTable(table, tuple(primary_key), if_not_exists, sql)
+        unique = tuple(columns for columns in dict.fromkeys(unique_columns) if columns != tuple(primary_key))
+        return CreateTable(table, tuple(primary_key), if_not_exists, sql, unique)
     if kind == "INDEX":
         if statement.args.get("unique"):
             raise SharedDDLError("unique indexes are not supported; Chronos indexes only speed up reads")
@@ -146,6 +171,13 @@ def apply_shared_ddl(workspace: ChronosWorkspaceContext, store: str, sql: str,
         if not info.exists:
             operations.create_table(workspace, store, statement.sql)
         operations.register_table(workspace, store, statement.table, list(statement.primary_key))
+        for columns in statement.unique_columns:
+            # A lookup index, named as PostgreSQL names the constraint's
+            # index and scoped to the schema. UNIQUE is not enforced.
+            schema, _, bare = statement.table.rpartition(".")
+            name = f"{bare}_{'_'.join(columns)}_key"
+            operations.create_index(workspace, store, statement.table, list(columns),
+                                    f"{schema}.{name}" if schema else name)
         return {"tag": "CREATE TABLE", "created": True}
     if not info.registered:
         raise SharedDDLError(f'relation "{statement.table}" does not exist', "42P01")
