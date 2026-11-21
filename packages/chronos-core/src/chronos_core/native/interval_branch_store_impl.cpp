@@ -1195,6 +1195,8 @@
             "  SELECT parent.branch_id, parent.parent_branch_id, ancestry.depth + 1 "
             "  FROM _chronos_branch_interval_branches AS parent "
             "  JOIN ancestry ON parent.branch_id = ancestry.parent_branch_id "
+            // A bound far beyond any real tree, so a parent loop cannot recurse forever.
+            "  WHERE ancestry.depth < 10000 "
             ") SELECT COALESCE(MAX(depth), 0) FROM ancestry",
             {branch_id}
         );
@@ -1311,9 +1313,11 @@
         if (include_descendants) {
             for (const auto &root : roots) {
                 auto rows = driver_->query(
+                    // UNION (not UNION ALL): the same rows for a branch tree,
+                    // and it terminates even if parent links ever form a loop.
                     "WITH RECURSIVE subtree(branch_id) AS ("
                     "  SELECT branch_id FROM _chronos_branch_interval_branches WHERE branch_id = ? "
-                    "UNION ALL "
+                    "UNION "
                     "  SELECT child.branch_id "
                     "  FROM _chronos_branch_interval_branches child "
                     "  JOIN subtree ON child.parent_branch_id = subtree.branch_id"
@@ -2094,7 +2098,7 @@
                     "  SELECT branch_id "
                     "  FROM _chronos_branch_interval_branches "
                     "  WHERE branch_id = ? "
-                    "UNION ALL "
+                    "UNION "  // terminates even if parent links ever form a loop
                     "  SELECT child.branch_id "
                     "  FROM _chronos_branch_interval_branches AS child "
                     "  JOIN subtree ON child.parent_branch_id = subtree.branch_id "

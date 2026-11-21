@@ -4937,3 +4937,18 @@ def test_interval_moving_a_branch_keeps_its_parent(sql_backend: str) -> None:
     finally:
         ctx.close()
 
+
+def test_interval_branch_queries_terminate_on_a_parent_loop(sql_backend: str) -> None:
+    """Rows broken by the earlier bug (a self-parented branch) must not hang branch queries."""
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("looped", from_branch="main")
+        ctx.metadata_db.execute(
+            "UPDATE _chronos_branch_interval_branches SET parent_branch_id = branch_id WHERE branch_id = 'looped'")
+        ctx.metadata_db.commit()
+        ctx.create_branch("child", from_branch="looped")  # computes the branch's depth
+        ctx.delete_branch("child")  # collects the branch's subtree
+        ctx.delete_branch("looped")
+        assert "looped" not in _parents(ctx)
+    finally:
+        ctx.close()
