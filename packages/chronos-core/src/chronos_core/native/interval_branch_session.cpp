@@ -931,7 +931,8 @@ class NativeBranchSessionImpl {
             }
             plan.columns.emplace_back(node->res_target->name);
         }
-        if (plan.columns.empty()) throw std::runtime_error("INSERT must specify a column list");
+        // Without a column list the values fill the table's columns in order;
+        // the columns are taken from the table when the statement runs.
         if (stmt->relation->alias && stmt->relation->alias->aliasname) {
             plan.alias = stmt->relation->alias->aliasname;
         }
@@ -971,7 +972,7 @@ class NativeBranchSessionImpl {
                 throw std::runtime_error("native INSERT only supports tuple VALUES");
             }
             auto *items = tuple_node->list;
-            if (items->n_items != plan.columns.size()) {
+            if (!plan.columns.empty() && items->n_items != plan.columns.size()) {
                 throw std::runtime_error("INSERT column/value count mismatch");
             }
             std::vector<PgQuery__Node *> tuple;
@@ -2447,7 +2448,24 @@ class NativeBranchSessionImpl {
         }
     }
 
-    std::int64_t execute_insert(const NativeInsertPlan &plan, const std::vector<Value> &params) {
+    // INSERT without a column list: the table's leading columns, one per value,
+    // as PostgreSQL assigns them.
+    NativeInsertPlan with_insert_columns(const NativeInsertPlan &planned) {
+        if (!planned.columns.empty()) return planned;
+        NativeInsertPlan plan = planned;
+        const NativeTableMeta meta = table_meta_for(plan.table);
+        const std::size_t width = plan.value_tuples.empty() ? 0 : plan.value_tuples.front().size();
+        for (const auto &tuple : plan.value_tuples) {
+            if (tuple.size() != width || width > meta.columns.size()) {
+                throw std::runtime_error("INSERT has more expressions than target columns");
+            }
+        }
+        plan.columns.assign(meta.columns.begin(), meta.columns.begin() + static_cast<std::ptrdiff_t>(width));
+        return plan;
+    }
+
+    std::int64_t execute_insert(const NativeInsertPlan &planned, const std::vector<Value> &params) {
+        const NativeInsertPlan plan = with_insert_columns(planned);
         if (plan.update_on_conflict) return execute_insert_on_conflict_update(plan, params);
         NativeTableMeta meta = table_meta_for(plan.table);
         const NativeRows rows = proposed_insert_rows(plan, meta, params);
