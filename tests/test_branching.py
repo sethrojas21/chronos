@@ -4905,6 +4905,12 @@ def test_interval_reset_branch_moves_a_branch_back_to_a_checkpoint(sql_backend: 
         assert ctx.merge_apply(source="agent", target="main").applied == 1
         assert _product(ctx.checkout("main"), "abc")["price"] == 12
 
+        # Only the branch's own checkpoints: another branch's would replace its data.
+        ctx.create_branch("other", from_branch="main")
+        ctx.create_checkpoint("other-cp", branch="other")
+        with pytest.raises(BranchingError, match="belongs to branch other"):
+            ctx.reset_branch("agent", "other-cp")
+        assert _product(ctx.checkout("agent"), "abc")["price"] == 12
         with pytest.raises(BranchNotFoundError):
             ctx.reset_branch("agent", "missing")
         with pytest.raises(BranchNotFoundError):

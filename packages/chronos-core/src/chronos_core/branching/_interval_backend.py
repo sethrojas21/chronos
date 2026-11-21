@@ -618,6 +618,8 @@ class _IntervalBackend(_SQLBranchBackend):
             self._native_branch_store.reset_branch(branch_id, checkpoint)
         except Exception as exc:
             message = str(exc)
+            if "chronos_reset_foreign_checkpoint:" in message:
+                raise BranchingError(message.split("chronos_reset_foreign_checkpoint: ", 1)[-1]) from exc
             if "branch not found: checkpoint:" in message:
                 raise BranchNotFoundError(f"checkpoint:{checkpoint}") from exc
             if "branch not found" in message:

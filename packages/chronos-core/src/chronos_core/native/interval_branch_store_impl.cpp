@@ -1947,6 +1947,14 @@
             }
 
             const std::string parent_branch_id = native_as_string(cp_rows[0][0]);
+            if (replace_segment && parent_branch_id != branch_id) {
+                // A reset moves a branch back in its own history; another
+                // branch's checkpoint would replace its data wholesale.
+                throw std::runtime_error(
+                    "chronos_reset_foreign_checkpoint: checkpoint " + checkpoint + " belongs to branch " +
+                    parent_branch_id + ", not " + branch_id +
+                    "; reset needs a checkpoint of this branch (use create_branch_from_checkpoint instead)");
+            }
             NativeDirectMergeSegment segment = load_direct_segment_by_id(native_as_int(cp_rows[0][1]));
             const cpp_int hi = cpp_int_from_decimal(segment.live_hi);
             auto allocation = driver_->query(
