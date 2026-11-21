@@ -175,6 +175,87 @@ void check_versioning_routes(std::uint16_t port) {
     }
 }
 
+void check_principal_routes(std::uint16_t port) {
+    const std::string base = "/v1/workspaces/training/principals";
+    const Json spec = {
+        {"name", "agent@7"},
+        {"default_branch", "agent/7"},
+        {"branches", Json::array({"agent/7", "scratch/*"})},
+        {"read_only_branches", Json::array({"main"})},
+    };
+    check(request(port, http::verb::post, base, spec, "wrong").result() == http::status::unauthorized,
+          "principal routes require the controller token");
+    auto created = request(port, http::verb::post, base, spec);
+    check(created.result() == http::status::created, created.body());
+    auto principal = body_of(created);
+    const auto password = principal.at("password").get<std::string>();
+    check(password.size() == 64, "creation returns the password once");
+    check(principal.at("database_urls").at("orders") ==
+              "postgresql://agent%407:" + password + "@127.0.0.1:15432/orders",
+          "creation returns database URLs with the name percent-encoded: " + created.body());
+    check(principal.at("default_branch") == "agent/7" &&
+              principal.at("read_only_branches") == Json::array({"main"}),
+          "creation returns the permissions");
+    check(request(port, http::verb::post, base, spec).result() == http::status::conflict,
+          "a duplicate name conflicts");
+    auto typo = spec;
+    typo["name"] = "other";
+    typo["branch"] = "x";
+    check(request(port, http::verb::post, base, typo).result() == http::status::bad_request,
+          "unknown fields are refused");
+    auto undefaulted = spec;
+    undefaulted["name"] = "other";
+    undefaulted["default_branch"] = "elsewhere";
+    check(request(port, http::verb::post, base, undefaulted).result() == http::status::bad_request,
+          "the default branch must be allowed");
+    auto grant_like = spec;
+    grant_like["name"] = "0123456789abcdef0123456789abcdef";
+    check(request(port, http::verb::post, base, grant_like).result() == http::status::bad_request,
+          "a principal name must not look like a grant id");
+    check(request(port, http::verb::post, "/v1/workspaces/missing/principals", spec).result() ==
+              http::status::not_found,
+          "an unknown workspace is not found");
+
+    const std::string one = base + "/agent%407";
+    auto fetched = request(port, http::verb::get, one);
+    check(fetched.result() == http::status::ok, fetched.body());
+    check(!body_of(fetched).contains("password") && fetched.body().find(password) == std::string::npos &&
+              fetched.body().find("pbkdf2") == std::string::npos,
+          "lookup never returns secrets");
+    auto listed = request(port, http::verb::get, base);
+    check(listed.result() == http::status::ok && body_of(listed).at("principals").size() == 1 &&
+              listed.body().find(password) == std::string::npos && listed.body().find("pbkdf2") == std::string::npos,
+          "listing returns principals without secrets: " + listed.body());
+    check(request(port, http::verb::get, base + "/nobody").result() == http::status::not_found,
+          "an unknown principal is not found");
+
+    auto patched = request(port, http::verb::patch, one, {{"branches", Json::array({"agent/7", "agent/8"})}});
+    check(patched.result() == http::status::ok &&
+              body_of(patched).at("branches") == Json::array({"agent/7", "agent/8"}) &&
+              body_of(patched).at("read_only_branches") == Json::array({"main"}),
+          "PATCH replaces only the given fields: " + patched.body());
+    check(request(port, http::verb::patch, one, {{"default_branch", "nowhere"}}).result() ==
+              http::status::bad_request,
+          "PATCH keeps the default branch allowed");
+    check(request(port, http::verb::patch, one, {{"password", "x"}}).result() == http::status::bad_request,
+          "PATCH cannot set a password");
+
+    auto rotated = request(port, http::verb::post, one + "/rotate");
+    check(rotated.result() == http::status::ok, rotated.body());
+    const auto new_password = body_of(rotated).at("password").get<std::string>();
+    check(new_password.size() == 64 && new_password != password, "rotation returns a new password");
+    check(body_of(rotated).at("name") == "agent@7", "rotation keeps the name");
+    check(request(port, http::verb::post, base + "/nobody/rotate").result() == http::status::not_found,
+          "rotating an unknown principal is not found");
+
+    auto deleted = request(port, http::verb::delete_, one);
+    check(deleted.result() == http::status::ok && body_of(deleted).at("state") == "deleted", deleted.body());
+    check(request(port, http::verb::get, one).result() == http::status::not_found,
+          "a deleted principal is gone");
+    check(request(port, http::verb::delete_, one).result() == http::status::not_found,
+          "deleting twice is not found");
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +372,7 @@ int main() {
     check(request(port, http::verb::get, branch_path + "?verbose=1").result() == http::status::ok,
           "existing routes must ignore the query string");
 
+    check_principal_routes(port);
     check_versioning_routes(port);
 
     server.stop();

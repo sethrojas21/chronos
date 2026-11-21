@@ -9,8 +9,10 @@
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -162,6 +164,60 @@ std::vector<std::string> path_parts(const std::string &target) {
     return parts;
 }
 
+Json principal_json(const Principal &principal) {
+    return {
+        {"workspace", principal.workspace},
+        {"name", principal.name},
+        {"default_branch", principal.default_branch},
+        {"branches", principal.branches},
+        {"read_only_branches", principal.read_only_branches},
+        {"created_at", principal.created_at},
+        {"updated_at", principal.updated_at},
+    };
+}
+
+// Principal routes accept only their documented fields, so a misspelled
+// permission is an error rather than silently ignored.
+Json principal_body(const std::string &body, const std::vector<std::string> &allowed) {
+    Json parsed = body.empty() ? Json::object() : Json::parse(body);
+    if (!parsed.is_object()) throw GatewayError("request body must be a JSON object");
+    for (const auto &[key, value] : parsed.items()) {
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+            throw GatewayError("unexpected field: " + key);
+        }
+    }
+    return parsed;
+}
+
+std::vector<std::string> patterns(const Json &body, const std::string &field) {
+    const auto found = body.find(field);
+    if (found == body.end()) return {};
+    if (!found->is_array()) throw GatewayError(field + " must be an array of branch patterns");
+    std::vector<std::string> result;
+    for (const auto &item : *found) {
+        if (!item.is_string()) throw GatewayError(field + " must be an array of branch patterns");
+        result.push_back(item.get<std::string>());
+    }
+    return result;
+}
+
+std::string string_field(const Json &body, const std::string &field) {
+    const auto found = body.find(field);
+    if (found == body.end() || !found->is_string()) throw GatewayError(field + " must be a string");
+    return found->get<std::string>();
+}
+
+// Percent-encodes a URL userinfo part (principal names may contain '@').
+std::string userinfo(const std::string &text) {
+    std::ostringstream out;
+    for (const unsigned char c : text) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.') out << c;
+        else out << '%' << std::uppercase << std::hex << std::setw(2) << std::setfill('0')
+                 << static_cast<unsigned int>(c) << std::nouppercase << std::dec;
+    }
+    return out.str();
+}
+
 } // namespace
 
 class ControlServer::Impl {
@@ -264,6 +320,7 @@ class ControlServer::Impl {
             }
             const auto parts = path_parts(target);
             if (auto routed = versioning(parts, request, query)) return std::move(*routed);
+            if (auto routed = principals(parts, request)) return std::move(*routed);
             if (parts.size() == 4 && parts[0] == "v1" && parts[1] == "workspaces" &&
                 parts[3] == "branches" && request.method() == http::verb::post) {
                 return create(parts[2], request);
@@ -285,6 +342,10 @@ class ControlServer::Impl {
                 return credentials(parts[2], parts[4], request);
             }
             return json_response(http::status::not_found, {{"error", "not found"}});
+        } catch (const NotFoundError &error) {
+            return json_response(http::status::not_found, {{"error", error.what()}});
+        } catch (const ConflictError &error) {
+            return json_response(http::status::conflict, {{"error", error.what()}});
         } catch (const GatewayError &error) {
             return json_response(http::status::bad_request, {{"error", error.what()}});
         } catch (const std::exception &error) {
@@ -349,6 +410,75 @@ class ControlServer::Impl {
         response.body() = result.body;
         response.prepare_payload();
         return response;
+    }
+
+    // Principals (stable SQL logins) of a workspace. Admin only: the
+    // controller token manages them; passwords appear only in the responses
+    // to creation and rotation.
+    std::optional<http::response<http::string_body>> principals(
+        const std::vector<std::string> &parts,
+        const http::request<http::string_body> &request) {
+        if (parts.size() < 4 || parts.size() > 6 || parts[0] != "v1" || parts[1] != "workspaces" ||
+            parts[3] != "principals") {
+            return std::nullopt;
+        }
+        auto &registry = runtime.principals();
+        const auto &workspace_name = parts[2];
+        const auto method = request.method();
+        if (parts.size() == 4 && method == http::verb::post) {
+            const auto body = principal_body(
+                request.body(), {"name", "default_branch", "branches", "read_only_branches"});
+            PrincipalSpec spec;
+            spec.name = string_field(body, "name");
+            spec.default_branch = string_field(body, "default_branch");
+            spec.branches = patterns(body, "branches");
+            spec.read_only_branches = patterns(body, "read_only_branches");
+            return json_response(http::status::created, issued_json(registry.create(workspace_name, spec)));
+        }
+        if (parts.size() == 4 && method == http::verb::get) {
+            Json listed = Json::array();
+            for (const auto &principal : registry.list(workspace_name)) listed.push_back(principal_json(principal));
+            return json_response(http::status::ok, {{"principals", listed}});
+        }
+        if (parts.size() == 5 && method == http::verb::get) {
+            auto principal = registry.get(workspace_name, parts[4]);
+            if (!principal) throw NotFoundError("principal not found");
+            return json_response(http::status::ok, principal_json(*principal));
+        }
+        if (parts.size() == 5 && method == http::verb::patch) {
+            const auto body = principal_body(
+                request.body(), {"default_branch", "branches", "read_only_branches"});
+            PrincipalUpdate update;
+            if (body.contains("default_branch")) update.default_branch = string_field(body, "default_branch");
+            if (body.contains("branches")) update.branches = patterns(body, "branches");
+            if (body.contains("read_only_branches")) {
+                update.read_only_branches = patterns(body, "read_only_branches");
+            }
+            return json_response(http::status::ok,
+                                 principal_json(registry.update(workspace_name, parts[4], update)));
+        }
+        if (parts.size() == 5 && method == http::verb::delete_) {
+            registry.remove(workspace_name, parts[4]);
+            return json_response(http::status::ok,
+                                 {{"workspace", workspace_name}, {"name", parts[4]}, {"state", "deleted"}});
+        }
+        if (parts.size() == 6 && parts[5] == "rotate" && method == http::verb::post) {
+            principal_body(request.body(), {});
+            return json_response(http::status::ok, issued_json(registry.rotate(workspace_name, parts[4])));
+        }
+        return std::nullopt;
+    }
+
+    Json issued_json(const IssuedPrincipal &issued) const {
+        auto result = principal_json(issued.principal);
+        result["password"] = issued.password;
+        Json urls = Json::object();
+        for (const auto &store : runtime.postgres_store_aliases(issued.principal.workspace)) {
+            urls[store] = "postgresql://" + userinfo(issued.principal.name) + ":" + issued.password +
+                "@" + postgres.endpoint() + "/" + store;
+        }
+        result["database_urls"] = std::move(urls);
+        return result;
     }
 
     http::response<http::string_body> create(
