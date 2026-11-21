@@ -4911,3 +4911,29 @@ def test_interval_reset_branch_moves_a_branch_back_to_a_checkpoint(sql_backend: 
             ctx.reset_branch("nobody", "before")
     finally:
         ctx.close()
+
+
+def _parents(ctx: ChronosBranchContext) -> dict[str, str | None]:
+    rows = ctx.metadata_db.execute(
+        "SELECT branch_id, parent_branch_id FROM _chronos_branch_interval_branches").fetchall()
+    return {row["branch_id"]: row["parent_branch_id"] for row in rows}
+
+
+def test_interval_moving_a_branch_keeps_its_parent(sql_backend: str) -> None:
+    """reset_branch and keep-branch merges never make a branch its own ancestor."""
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("probe", from_branch="main")
+        ctx.create_checkpoint("cp", branch="probe")
+        ctx.reset_branch("probe", "cp")
+        assert _parents(ctx)["probe"] == "main"
+
+        ctx.create_branch("a", from_branch="main")
+        ctx.create_branch("b", from_branch="a")
+        ctx.checkout("a").execute("UPDATE products SET price = :p WHERE sku = :s", {"s": "abc", "p": 11})
+        ctx.merge_apply(source="a", target="b", keep_branch=True)
+        parents = _parents(ctx)
+        assert parents["a"] == "main" and parents["b"] == "a"
+    finally:
+        ctx.close()
+

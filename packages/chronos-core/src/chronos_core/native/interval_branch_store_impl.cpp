@@ -1620,6 +1620,9 @@
     // replace_segment: instead of creating branch_id, move the existing
     // branch's head (expected at that segment) to the new child of
     // from_branch, so the branch continues from from_branch's current state.
+    // Its parent_branch_id (the branch tree used for deletes and session
+    // fencing) is left unchanged: rewriting it could make a branch its own
+    // ancestor.
     // The branch's current head segment and kind, for the replace mode.
     std::pair<std::int64_t, std::string> branch_head(const std::string &branch_id) {
         auto rows = driver_->query(
@@ -1816,7 +1819,7 @@
                     // The existing branch moves to the new child, if its head
                     // is still where the caller saw it.
                     ? "UPDATE _chronos_branch_interval_branches "
-                      "SET current_segment_id = ?, parent_branch_id = ? "
+                      "SET current_segment_id = ? "
                       "WHERE branch_id = ? AND current_segment_id = ? "
                       "AND EXISTS (SELECT 1 FROM updated_parent) "
                       "RETURNING 1"
@@ -1838,7 +1841,7 @@
                         continuation_id, from_branch, source_segment.segment_id,
                     };
                     if (replace_segment) {
-                        params.insert(params.end(), {child_id, from_branch, branch_id, *replace_segment});
+                        params.insert(params.end(), {child_id, branch_id, *replace_segment});
                     } else {
                         params.insert(params.end(), {
                             branch_id, child_id, from_branch,
@@ -1882,9 +1885,9 @@
             if (replace_segment) {
                 const std::int64_t moved = driver_->execute_changes(
                     "UPDATE _chronos_branch_interval_branches "
-                    "SET current_segment_id = ?, parent_branch_id = ? "
+                    "SET current_segment_id = ? "
                     "WHERE branch_id = ? AND current_segment_id = ?",
-                    {child_id, from_branch, branch_id, *replace_segment}
+                    {child_id, branch_id, *replace_segment}
                 );
                 if (moved != 1) {
                     throw std::runtime_error("branch head changed during native branch continuation: " + branch_id);
@@ -1912,7 +1915,7 @@
 
     // replace_segment: instead of creating branch_id, move the existing
     // branch's head (expected at that segment) to a new child of the
-    // checkpoint, keeping its name and metadata.
+    // checkpoint, keeping its name, metadata, and parent_branch_id.
     void create_branch_from_checkpoint(
         const std::string &branch_id,
         const std::string &checkpoint,
@@ -2001,9 +2004,9 @@
             if (replace_segment) {
                 const std::int64_t moved = driver_->execute_changes(
                     "UPDATE _chronos_branch_interval_branches "
-                    "SET current_segment_id = ?, parent_branch_id = ? "
+                    "SET current_segment_id = ? "
                     "WHERE branch_id = ? AND current_segment_id = ?",
-                    {child_segment_id, parent_branch_id, branch_id, *replace_segment}
+                    {child_segment_id, branch_id, *replace_segment}
                 );
                 if (moved != 1) {
                     throw std::runtime_error("branch head changed during native branch reset: " + branch_id);
