@@ -309,6 +309,10 @@ class ControlServer::Impl {
                    method == http::verb::put) {
             operation = "update_branch_metadata";
             path["branch"] = parts[4];
+        } else if (resource == "branches" && parts.size() == 6 && parts[5] == "reset" &&
+                   method == http::verb::post) {
+            operation = "reset_branch";
+            path["branch"] = parts[4];
         } else if (resource == "checkpoints" && parts.size() == 4 && method == http::verb::post) {
             operation = "create_checkpoint";
         } else if (resource == "checkpoints" && parts.size() == 4 && method == http::verb::get) {

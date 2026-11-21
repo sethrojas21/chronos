@@ -614,6 +614,41 @@ class TestWorkspaceSQLWorkflows:
         assert merge("plain", "main", ok=False) is None
         assert value("main") == 4
 
+    @pytest.mark.parametrize("atomic", [False, True], ids=["coordinated", "atomic"])
+    def test_branch_reset_moves_a_branch_back_to_a_checkpoint(
+        self, cli_database: DatabaseConfig, tmp_path: Path, atomic: bool,
+    ) -> None:
+        config = _workspace_config_file(tmp_path, cli_database, atomic=atomic)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "CREATE TABLE items (id INTEGER PRIMARY KEY, v INTEGER)", "--store", "app")
+        invoke("table", "register", "items", "--primary-key", "id", "--store", "app")
+        invoke("execute", "INSERT INTO items (id, v) VALUES (1, 1)", "--store", "app")
+        invoke("branch", "create", "agent", "--metadata", '{"agent":"a1"}')
+        set_v = lambda branch, value: invoke(  # noqa: E731
+            "execute", f"UPDATE items SET v = {value} WHERE id = 1", "--store", "app", "--branch", branch)
+        value = lambda branch: invoke(  # noqa: E731
+            "query", "SELECT v FROM items", "--store", "app", "--branch", branch)[0]["v"]
+        set_v("agent", 2)
+        invoke("checkpoint", "create", "good", "--branch", "agent")
+        set_v("agent", 99)
+
+        assert invoke("branch", "reset", "agent", "good") is None
+        assert value("agent") == 2
+        # The branch keeps its name and metadata; no branch is created.
+        assert invoke("branch", "list") == ["agent", "main"]
+        records = {record["branch_id"]: record for record in invoke("branch", "list", "--store", "app")}
+        assert records["agent"]["metadata"] == {"agent": "a1"}
+        # The checkpoint stays readable, and create-from-checkpoint is unchanged.
+        invoke("branch", "create-from-checkpoint", "restored", "good")
+        assert value("restored") == 2
+        # Work continues on the branch.
+        set_v("agent", 3)
+        assert value("agent") == 3 and value("main") == 1
+
+        invoke("branch", "reset", "agent", "missing", ok=False)
+        invoke("branch", "reset", "nobody", "good", ok=False)
+        assert value("agent") == 3
+
     def test_relational_sql_inputs_and_rollback(self, cli_database: DatabaseConfig, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, cli_database)
         invoke = partial(_invoke_workspace, config)

@@ -88,7 +88,7 @@ scope for each store. See the atomic SQL example below. Use
 split-data workspaces because the Python API's diff does not use merge scopes.
 See the filesystem sections below for OverlayFS and native ChronosFS setup.
 
-### Long-lived branches that merge repeatedly
+### Long-lived branches: repeated merges and reset
 
 `merge apply` and `merge atomic-apply` accept `--keep-branch`. After the merge,
 the source branch continues from the merged target, keeping its name: it then
@@ -104,6 +104,12 @@ chronos merge apply agent main --keep-branch
 chronos execute "UPDATE items SET v = 3 WHERE id = 1" --store app --branch agent
 chronos merge apply agent main --keep-branch   # merges cleanly again
 ```
+
+`chronos branch reset BRANCH CHECKPOINT` moves a branch back to a checkpoint in
+place: the branch keeps its name and metadata, the checkpoint stays readable, and
+work continues on the branch. An unknown branch or checkpoint exits with status 1.
+`branch create-from-checkpoint NAME CHECKPOINT` is unchanged and still creates a
+new branch.
 
 ## Checked terminal demo
 

@@ -27,6 +27,11 @@ def create_branch_from_checkpoint(workspace: ChronosWorkspaceContext, name: str,
     return workspace.create_branch_from_checkpoint(name, checkpoint)
 
 
+def reset_branch(workspace: ChronosWorkspaceContext, branch: str, checkpoint: str) -> Any:
+    """Move a branch back to a checkpoint in place, keeping its name and metadata."""
+    return workspace.reset_branch(branch, checkpoint)
+
+
 def update_branch_metadata(workspace: ChronosWorkspaceContext, store: str, name: str,
                            metadata: dict[str, Any]) -> Any:
     return workspace.stores[store].update_branch_metadata(name, metadata)

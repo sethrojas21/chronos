@@ -315,6 +315,13 @@ def create_branch_from_checkpoint(ctx: typer.Context, name: str, checkpoint: str
         print_result(operations.create_branch_from_checkpoint(workspace, name, checkpoint))
 
 
+@branch_app.command("reset")
+def reset_branch(ctx: typer.Context, name: str, checkpoint: str) -> None:
+    """Move branch NAME back to CHECKPOINT in place, keeping its name and metadata."""
+    with connect_workspace(ctx) as workspace:
+        print_result(operations.reset_branch(workspace, name, checkpoint))
+
+
 @branch_app.command("delete")
 def delete_branch(ctx: typer.Context, name: str) -> None:
     with connect_workspace(ctx) as workspace:

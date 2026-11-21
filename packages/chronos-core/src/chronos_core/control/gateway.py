@@ -171,6 +171,11 @@ def _update_branch_metadata(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     return lambda ws: operations.update_branch_metadata(ws, store, branch, metadata)
 
 
+def _reset_branch(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
+    branch, checkpoint = _text(a, "branch"), _text(a, "checkpoint")
+    return lambda ws: operations.reset_branch(ws, branch, checkpoint)
+
+
 def _create_checkpoint(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     name, branch = _text(a, "name"), _text(a, "branch", required=False, default="main")
     metadata = _object(a, "metadata")
@@ -248,6 +253,7 @@ def _create_index(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
 _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[str], int, bool]] = {
     "list_branches": (_list_branches, frozenset({"store"}), 200, False),
     "update_branch_metadata": (_update_branch_metadata, frozenset({"store", "branch", "metadata"}), 200, False),
+    "reset_branch": (_reset_branch, frozenset({"branch", "checkpoint"}), 200, False),
     "create_checkpoint": (_create_checkpoint, frozenset({"name", "branch", "metadata"}), 201, False),
     "list_checkpoints": (_list_checkpoints, frozenset({"store", "branch", "metadata_filter"}), 200, False),
     "diff": (_diff, frozenset({"left", "right"}), 200, True),

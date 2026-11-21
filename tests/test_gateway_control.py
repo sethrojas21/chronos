@@ -64,6 +64,27 @@ def test_branches_checkpoints_and_diff(control: GatewayControl) -> None:
     assert diff["app"]["changes"][0]["after"] == {"id": 1, "state": "paid"}
 
 
+def test_reset_branch_moves_a_branch_back_to_a_checkpoint(control: GatewayControl) -> None:
+    _with_feature_branch(control)
+    workspace = control._open(control._workspaces["local"])
+    app = workspace.stores["app"]
+    assert _call(control, "update_branch_metadata", store="app", branch="feature", metadata={"agent": "a1"})[0] == 200
+    assert _call(control, "create_checkpoint", name="paid", branch="feature")[0] == 201
+    app.checkout("feature").execute("UPDATE orders SET state = 'lost' WHERE id = 1")
+
+    assert _call(control, "reset_branch", branch="feature", checkpoint="paid") == (200, None)
+    assert app.checkout("feature").query("SELECT state FROM orders") == [{"state": "paid"}]
+    # Same branch and metadata, no new branch, and the checkpoint stays readable.
+    assert _call(control, "list_branches") == (200, ["feature", "main"])
+    records = {record["branch_id"]: record for record in _call(control, "list_branches", store="app")[1]}
+    assert records["feature"]["metadata"] == {"agent": "a1"}
+    assert app.checkout_checkpoint("paid").query("SELECT state FROM orders") == [{"state": "paid"}]
+
+    assert _call(control, "reset_branch", branch="feature", checkpoint="missing")[0] == 404
+    assert _call(control, "reset_branch", branch="ghost", checkpoint="paid")[0] == 404
+    assert _call(control, "reset_branch", branch="feature") == (400, {"error": "checkpoint is required"})
+
+
 def test_tables_and_indexes(control: GatewayControl) -> None:
     assert _call(control, "register_table", store="app", table="orders", primary_key="id") == (201, None)
     status, index = _call(control, "create_index", store="app", table="orders", columns=["state"])

@@ -39,7 +39,7 @@ def workspace_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Mag
         '[stores.other]\nkind="sqlite"\ndatabase_url="sqlite:///other.sqlite"\n'
     )
     workspace = MagicMock()
-    for method in ("create_branch", "create_branch_from_checkpoint", "delete_branch", "create_checkpoint",
+    for method in ("create_branch", "create_branch_from_checkpoint", "reset_branch", "delete_branch", "create_checkpoint",
                    "diff", "merge_preview", "merge_apply", "merge_atomic_preview", "merge_atomic"):
         getattr(workspace, method).return_value = None
     workspace.list_branches.return_value = ["main"]
@@ -415,6 +415,7 @@ class TestWorkspaceCommands:
         (["branch", "create", "trial", "--metadata", '{"owner":"agent"}'], "create_branch", ("trial",),
          {"from_branch": "main", "metadata": {"owner": "agent"}}),
         (["branch", "create-from-checkpoint", "trial", "saved"], "create_branch_from_checkpoint", ("trial", "saved"), {}),
+        (["branch", "reset", "trial", "saved"], "reset_branch", ("trial", "saved"), {}),
         (["branch", "delete", "trial"], "delete_branch", ("trial",), {}),
         (["checkpoint", "create", "saved", "--branch", "trial"], "create_checkpoint", ("saved",), {"branch": "trial", "metadata": None}),
         (["checkpoint", "create", "saved", "--metadata", '{"step":2}'], "create_checkpoint", ("saved",),

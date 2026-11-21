@@ -122,6 +122,18 @@ void check_versioning_routes(std::uint16_t port) {
     check(metadata.result() == http::status::bad_request &&
               body_of(metadata).at("error") == "unexpected arguments: extra",
           "metadata update passes body arguments: " + metadata.body());
+    // Reset takes the branch from the path and the checkpoint from the body.
+    auto reset = request(port, http::verb::post, base + "/branches/main/reset", {{"extra", true}});
+    check(reset.result() == http::status::bad_request &&
+              body_of(reset).at("error") == "unexpected arguments: extra",
+          "branch reset passes body arguments: " + reset.body());
+    auto unnamed = request(port, http::verb::post, base + "/branches/main/reset");
+    check(unnamed.result() == http::status::bad_request &&
+              body_of(unnamed).at("error") == "checkpoint is required",
+          "branch reset needs a checkpoint: " + unnamed.body());
+    check(request(port, http::verb::get, base + "/branches/main/reset").result() ==
+              http::status::not_found,
+          "branch reset is POST only");
     auto index = request(port, http::verb::post, base + "/tables/orders/indexes",
                          {{"store", "orders"}});
     check(index.result() == http::status::bad_request &&
