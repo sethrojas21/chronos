@@ -115,6 +115,30 @@ Each workspace chooses how table structure is versioned with
 `information_schema.columns` reflects a shared table's columns.
 `pg_indexes` does not yet list Chronos indexes.
 
+### PostgreSQL schemas and search_path
+
+With PostgreSQL stores, a shared-structure workspace supports schemas as
+namespaces that every branch shares (schemas themselves are not versioned):
+
+- `CREATE SCHEMA [IF NOT EXISTS] name` creates the schema in the store.
+- A table in a schema is registered as `schema.table` and versioned like any
+  other: `CREATE TABLE "s"."t" (...)`, or an unqualified `CREATE TABLE`, which
+  goes to the first schema of the connection's search path.
+- Each connection keeps its own search path, set by `SET search_path TO ...`
+  or by the startup option `-c search_path=...` (as libpq's and
+  node-postgres's `options` send it), cleared by `RESET search_path`, and
+  reported by `SHOW search_path`. Unqualified table names in queries and in
+  INSERT, UPDATE, and DELETE resolve along it to the first registered table;
+  qualified names are used as written. `current_schema()` returns the first
+  schema of the path.
+- Index names are per schema, as in PostgreSQL: an index on a schema's table
+  is registered as `schema.index`.
+
+Known limits: `DROP SCHEMA` is refused; `set_config('search_path', ...)` is
+not tracked; `current_schemas()` and catalog views other than
+`information_schema.columns` and `information_schema.schemata`/`tables` are
+answered by the store as is; and SQLite stores have no schemas.
+
 `run-local.sh` runs workspace `local` with the default and workspace `shared`
 with `"schema_branching": false`, each on its own databases.
 

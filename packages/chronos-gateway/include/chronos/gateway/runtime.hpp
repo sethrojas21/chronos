@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace chronos::gateway {
 
@@ -90,6 +91,13 @@ class SqlBranchSession {
     // False when the workspace shares one table structure across branches;
     // SQL clients then may not change table structure on a branch.
     bool schema_branching() const { return schema_branching_; }
+    // The connection's PostgreSQL search_path ("$user" dropped); empty means
+    // the default, where names resolve as written.
+    const std::vector<std::string> &search_path() const { return search_path_; }
+    void set_search_path(std::vector<std::string> schemas) {
+        session_.set_search_path(schemas);
+        search_path_ = std::move(schemas);
+    }
     void set_schema_branching(bool enabled) { schema_branching_ = enabled; }
 
   private:
@@ -99,6 +107,7 @@ class SqlBranchSession {
     chronos::native::NativeBranchSession session_;
     AccessGrant access_grant_;
     bool schema_branching_ = true;
+    std::vector<std::string> search_path_;
 };
 
 class GatewayRuntime {

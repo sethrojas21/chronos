@@ -268,6 +268,163 @@ void send_result(tcp::socket &socket, const IntervalQueryResult &result) {
     send_data_rows(socket, result);
 }
 
+// --- search_path -------------------------------------------------------------
+// The gateway keeps each connection's search_path itself (the store's own
+// connection always uses public) and gives it to the branch session, which
+// resolves unqualified table names along it.
+
+// Schema names from a search_path value: double-quoted names are kept as
+// written, unquoted ones are lowercased, and "$user" is dropped.
+std::vector<std::string> parse_search_path(const std::string &text) {
+    std::vector<std::string> schemas;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',')) ++i;
+        if (i >= text.size()) break;
+        std::string name;
+        if (text[i] == '"' || text[i] == '\'') {
+            const char quote = text[i++];
+            while (i < text.size()) {
+                if (text[i] == quote && i + 1 < text.size() && text[i + 1] == quote) { name += quote; i += 2; continue; }
+                if (text[i] == quote) { ++i; break; }
+                name += text[i++];
+            }
+            if (quote == '\'') {  // 'a, b' is one value holding a list
+                for (auto &inner : parse_search_path(name)) schemas.push_back(std::move(inner));
+                continue;
+            }
+        } else {
+            while (i < text.size() && text[i] != ',' && !std::isspace(static_cast<unsigned char>(text[i]))) {
+                name += static_cast<char>(std::tolower(static_cast<unsigned char>(text[i++])));
+            }
+        }
+        if (!name.empty() && name != "$user") schemas.push_back(std::move(name));
+    }
+    return schemas;
+}
+
+std::string format_search_path(const std::vector<std::string> &schemas) {
+    if (schemas.empty()) return "\"$user\", public";
+    std::string text;
+    for (const auto &schema : schemas) {
+        if (!text.empty()) text += ", ";
+        text += schema;
+    }
+    return text;
+}
+
+// The search_path in a StartupMessage's options ("-c search_path=x" or
+// "--search_path=x"), if any.
+std::optional<std::string> startup_search_path(const std::string &options) {
+    for (const std::string key : {"search_path=", "search-path="}) {
+        const auto at = options.find(key);
+        if (at == std::string::npos) continue;
+        std::size_t end = at + key.size();
+        while (end < options.size() && !std::isspace(static_cast<unsigned char>(options[end]))) {
+            if (options[end] == '\\' && end + 1 < options.size()) ++end;  // libpq escapes spaces
+            ++end;
+        }
+        std::string value;
+        for (std::size_t i = at + key.size(); i < end; ++i) {
+            if (options[i] == '\\' && i + 1 < end) ++i;
+            value += options[i];
+        }
+        return value;
+    }
+    return std::nullopt;
+}
+
+std::string lowercase(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+// The value of "SET [SESSION | LOCAL] search_path {TO | =} value", if sql is one.
+std::optional<std::string> set_search_path_value(const std::string &sql) {
+    std::istringstream words(sql);
+    std::string word;
+    words >> word;
+    if (lowercase(word) != "set") return std::nullopt;
+    words >> word;
+    if (lowercase(word) == "session" || lowercase(word) == "local") words >> word;
+    std::string target = lowercase(word);
+    std::string rest;
+    std::getline(words, rest);
+    // "search_path=x" may arrive as one word.
+    if (target.rfind("search_path=", 0) == 0) return target.substr(12) + rest;
+    if (target != "search_path") return std::nullopt;
+    auto start = rest.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return std::string();
+    if (rest[start] == '=') ++start;
+    else if (lowercase(rest.substr(start, 2)) == "to") start += 2;
+    std::string value = rest.substr(start);
+    while (!value.empty() && (value.back() == ';' || std::isspace(static_cast<unsigned char>(value.back())))) {
+        value.pop_back();
+    }
+    if (lowercase(value.substr(value.find_first_not_of(" \t") == std::string::npos ? 0 :
+                               value.find_first_not_of(" \t"))) == "default") {
+        return std::string();
+    }
+    return value;
+}
+
+bool resets_search_path(const std::string &sql) {
+    std::istringstream words(sql);
+    std::string first, second;
+    words >> first >> second;
+    first = lowercase(first);
+    second = lowercase(second);
+    while (!second.empty() && second.back() == ';') second.pop_back();
+    return (first == "reset" && (second == "search_path" || second == "all")) ||
+           (first == "discard" && second == "all");
+}
+
+// current_schema() (or the bare current_schema) outside quotes becomes the
+// connection's schema as a literal, since the store's own connection would
+// answer public.
+std::string with_current_schema(const std::string &sql, const std::string &schema) {
+    static const std::string name = "current_schema";
+    std::string literal = "'";
+    for (char ch : schema) literal += ch == '\'' ? std::string("''") : std::string(1, ch);
+    literal += "'";
+    std::string out;
+    bool single = false, dbl = false;
+    for (std::size_t i = 0; i < sql.size();) {
+        const char ch = sql[i];
+        if (!dbl && ch == '\'') single = !single;
+        else if (!single && ch == '"') dbl = !dbl;
+        if (!single && !dbl && (i == 0 || !(std::isalnum(static_cast<unsigned char>(sql[i - 1])) ||
+                                            sql[i - 1] == '_' || sql[i - 1] == '.')) &&
+            lowercase(sql.substr(i, name.size())) == name) {
+            std::size_t end = i + name.size();
+            if (end < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[end])) || sql[end] == '_')) {
+                out += sql[i++];
+                continue;
+            }
+            std::size_t after = end;
+            while (after < sql.size() && std::isspace(static_cast<unsigned char>(sql[after]))) ++after;
+            if (after + 1 < sql.size() && sql[after] == '(') {
+                std::size_t close = after + 1;
+                while (close < sql.size() && std::isspace(static_cast<unsigned char>(sql[close]))) ++close;
+                if (close < sql.size() && sql[close] == ')') end = close + 1;
+            }
+            out += literal;
+            i = end;
+            continue;
+        }
+        out += ch;
+        ++i;
+    }
+    return out;
+}
+
+// The statement as the session runs it: current_schema() resolved.
+std::string for_connection(const SqlBranchSession &branch_session, const std::string &sql) {
+    const auto &path = branch_session.search_path();
+    return path.empty() ? sql : with_current_schema(sql, path.front());
+}
+
 // An error carrying its PostgreSQL SQLSTATE.
 class SqlStateError : public std::runtime_error {
   public:
@@ -292,7 +449,7 @@ void send_statement_description(tcp::socket &socket, SqlBranchSession &branch_se
     std::optional<IntervalQueryResult> columns;
     if (keyword == "select" || keyword == "with") {
         enforce_branch_sql_boundary(statement.sql);
-        auto description = branch_session.session().describe(statement.sql);
+        auto description = branch_session.session().describe(for_connection(branch_session, statement.sql));
         if (parameter_types.size() < description.parameter_types.size()) {
             parameter_types.resize(description.parameter_types.size(), 0);
         }
@@ -362,18 +519,29 @@ Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
         return {false, {}, "ROLLBACK"};
     }
     if (keyword == "set" || keyword == "reset" || keyword == "discard") {
-        return {false, {}, "SET"};
+        if (auto value = set_search_path_value(sql)) {
+            branch_session.set_search_path(parse_search_path(*value));
+        } else if (resets_search_path(sql)) {
+            branch_session.set_search_path({});
+        }
+        return {false, {}, keyword == "discard" ? "DISCARD ALL" : (keyword == "reset" ? "RESET" : "SET")};
     }
     if (keyword == "show") {
         IntervalQueryResult result;
-        result.columns = {"setting"};
-        result.rows = {{std::string("on")}};
+        const auto shown = lowercase(sql);
+        if (shown.find("search_path") != std::string::npos) {
+            result.columns = {"search_path"};
+            result.rows = {{format_search_path(branch_session.search_path())}};
+        } else {
+            result.columns = {"setting"};
+            result.rows = {{std::string("on")}};
+        }
         return {true, std::move(result), {}};
     }
     if (keyword == "select" || keyword == "with") {
-        return {true, session.query(sql, params), {}};
+        return {true, session.query(for_connection(branch_session, sql), params), {}};
     }
-    const auto affected = session.execute(sql, params);
+    const auto affected = session.execute(for_connection(branch_session, sql), params);
     std::string command = keyword;
     std::transform(command.begin(), command.end(), command.begin(), [](unsigned char c) {
         return static_cast<char>(std::toupper(c));
@@ -515,11 +683,19 @@ class PostgresServer::Impl {
             std::size_t password_offset = 0;
             const auto password = take_cstring(password_payload, password_offset);
             auto branch_session = runtime.open_postgres(user->second, password, database->second);
+            // libpq and node-postgres send "-c search_path=..." in options.
+            if (const auto options = startup.find("options"); options != startup.end()) {
+                if (auto value = startup_search_path(options->second)) {
+                    branch_session->set_search_path(parse_search_path(*value));
+                }
+            }
             const std::string workspace_name = branch_session->access_grant().workspace;
             const std::string store_alias = database->second;
-            const SharedDdl shared_ddl = [this, &workspace_name, &store_alias](const std::string &sql) {
+            const SharedDdl shared_ddl = [this, &workspace_name, &store_alias, &branch_session](
+                                             const std::string &sql) {
                 if (!python) throw GatewayError("table creation needs the gateway's Python control");
-                const nlohmann::json arguments = {{"store", store_alias}, {"sql", sql}};
+                const nlohmann::json arguments = {
+                    {"store", store_alias}, {"sql", sql}, {"search_path", branch_session->search_path()}};
                 const auto result = python->call(workspace_name, "apply_ddl", arguments.dump());
                 const auto body = nlohmann::json::parse(result.body, nullptr, false);
                 const bool object = body.is_object();
