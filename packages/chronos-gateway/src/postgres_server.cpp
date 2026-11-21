@@ -746,6 +746,12 @@ class PostgresServer::Impl {
                     error == asio::error::bad_descriptor) break;
                 throw boost::system::system_error(error);
             }
+            // A reply is several small writes (RowDescription, DataRow,
+            // CommandComplete, ReadyForQuery). With Nagle's algorithm each
+            // later write waits for the client's delayed ACK (~40 ms), so
+            // every statement paid that. PostgreSQL disables it too.
+            boost::system::error_code no_delay_error;
+            socket->set_option(tcp::no_delay(true), no_delay_error);
             std::lock_guard lock(clients_mutex);
             reap_finished_clients();
             sockets.push_back(socket);
