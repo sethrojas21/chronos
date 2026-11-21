@@ -637,7 +637,7 @@
                 return;
             }
 
-            const std::string physical = "_chronos_b_interval_" + physical_table_suffix(table);
+            const std::string physical = fit_identifier("_chronos_b_interval_" + physical_table_suffix(table));
             create_interval_physical_table(physical, defs, primary_key, create_secondary_indexes());
             std::vector<std::string> target_columns = columns;
             target_columns.push_back("live_lo");
@@ -1016,7 +1016,7 @@
     ) {
         (void)table;
         if (!meta.has_schema_binding) {
-            return "_chronos_idx_interval_" + index_name;
+            return fit_identifier("_chronos_idx_interval_" + index_name);
         }
         return "_chronos_idx_interval_sv_" +
             hex_u64(stable_fnv1a64(index_name + ":" + meta.physical_name), 24).substr(0, 24);
@@ -2314,7 +2314,8 @@
     }
 
     std::string physical_schema_table_name(const std::string &table) {
-        return "_chronos_b_interval_" + physical_table_suffix(table) + "_" + unique_schema_suffix().substr(0, 8);
+        return fit_identifier(
+            "_chronos_b_interval_" + physical_table_suffix(table) + "_" + unique_schema_suffix().substr(0, 8));
     }
 
     void lock_schema_metadata() {
@@ -2368,16 +2369,16 @@
     }
 
     std::string pk_hi_index_sql(const std::string &physical, const std::vector<std::string> &pk_columns) {
-        return "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_pk_hi") +
+        return "CREATE INDEX IF NOT EXISTS " + quote_ident(fit_identifier("idx_" + physical + "_pk_hi")) +
             " ON " + quote_ident(physical) + " (" + comma_join_quoted(pk_columns) + ", live_hi)";
     }
 
     std::string writer_segment_index_sql(const std::string &physical, const std::vector<std::string> &pk_columns) {
         if (dialect() == "postgres") {
-            return "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_writer_segment") +
+            return "CREATE INDEX IF NOT EXISTS " + quote_ident(fit_identifier("idx_" + physical + "_writer_segment")) +
                 " ON " + quote_ident(physical) + " (writer_segment_id) WHERE writer_segment_id > 1";
         }
-        std::string sql = "CREATE INDEX IF NOT EXISTS " + quote_ident("idx_" + physical + "_writer_segment") +
+        std::string sql = "CREATE INDEX IF NOT EXISTS " + quote_ident(fit_identifier("idx_" + physical + "_writer_segment")) +
             " ON " + quote_ident(physical) + " (writer_segment_id, " + comma_join_quoted(pk_columns) + ")";
         return sql;
     }

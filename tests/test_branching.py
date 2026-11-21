@@ -4823,3 +4823,31 @@ def test_log_session_reuses_lineage_for_reads_and_refreshes_after_writes(
     ]
     assert branch_reads > 0
     ctx.close()
+
+
+def test_postgres_long_table_names_get_distinct_physical_tables() -> None:
+    """Physical names longer than PostgreSQL's 63-byte limit must not collide."""
+    if not _postgres_dsn():
+        pytest.skip("PostgreSQL DSN unavailable")
+    _reset_postgres_schema()
+    context = ChronosBranchContext.connect(_postgres_dsn())
+    try:
+        context.db.execute('DROP SCHEMA IF EXISTS "hb_1795223737471" CASCADE')
+        context.db.execute('CREATE SCHEMA "hb_1795223737471"')
+        names = ["heavenbase_control_catalog", "heavenbase_control_catalog_heads"]
+        for name in names:
+            context.db.execute(f'CREATE TABLE "hb_1795223737471"."{name}" (k TEXT PRIMARY KEY, v TEXT)')
+        context.db.commit()
+        for name in names:
+            context.register_table(f"hb_1795223737471.{name}", ["k"])
+        physical = [row["physical_table"] for row in context.db.execute(
+            "SELECT physical_table FROM _chronos_branch_tables ORDER BY table_name").fetchall()]
+        assert len(set(physical)) == 2 and all(len(name.encode()) <= 63 for name in physical)
+
+        session = context.checkout("main")
+        for name in names:
+            session.upsert_rows(f"hb_1795223737471.{name}", [{"k": "a", "v": name}])
+        for name in names:
+            assert session.query(f"SELECT v FROM hb_1795223737471.{name}") == [{"v": name}]
+    finally:
+        context.close()

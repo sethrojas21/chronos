@@ -3953,6 +3953,17 @@ std::string identifier_token(const std::string &value) {
     return token + "_" + hex_u64(stable_fnv1a64(value), 10).substr(0, 10);
 }
 
+// PostgreSQL silently truncates identifiers to 63 bytes, so two long derived
+// names can become one. A name that fits is returned unchanged; a longer one
+// keeps a readable prefix and ends with a hash of the full name.
+constexpr std::size_t kMaxIdentifierBytes = 63;
+
+std::string fit_identifier(const std::string &name) {
+    if (name.size() <= kMaxIdentifierBytes) return name;
+    const std::string hash = hex_u64(stable_fnv1a64(name), 16).substr(0, 16);
+    return name.substr(0, kMaxIdentifierBytes - hash.size() - 1) + "_" + hash;
+}
+
 std::string physical_table_suffix(const std::string &table) {
     if (table.empty()) return identifier_token(table);
     const auto first = static_cast<unsigned char>(table.front());
@@ -4670,7 +4681,7 @@ std::unordered_map<std::string, Value> column_default_values(const NativeTableMe
 }
 
 std::string physical_interval_table(const std::string &logical_table) {
-    return "_chronos_b_interval_" + logical_table;
+    return fit_identifier("_chronos_b_interval_" + logical_table);
 }
 
 std::string select_columns_sql(const std::vector<std::string> &columns) {
