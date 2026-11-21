@@ -44,6 +44,7 @@ if(CHRONOS_GATEWAY_WITH_CHRONOS)
       src/control_server.cpp
       src/python_control.cpp
       src/postgres_server.cpp
+      src/principal_registry.cpp
       src/filesystem_view.cpp
       src/fuse_server.cpp
       src/nfs_server.cpp)
@@ -88,6 +89,16 @@ if(CHRONOS_GATEWAY_BUILD_TESTS)
     add_test(
       NAME chronos_gateway_runtime_tests
       COMMAND chronos_gateway_runtime_tests)
+    add_executable(
+      chronos_gateway_principal_tests
+      tests/principal_registry_test.cpp)
+    target_compile_features(chronos_gateway_principal_tests PRIVATE cxx_std_17)
+    target_link_libraries(
+      chronos_gateway_principal_tests
+      PRIVATE chronos_gateway_runtime)
+    add_test(
+      NAME chronos_gateway_principal_tests
+      COMMAND chronos_gateway_principal_tests)
     add_executable(
       chronos_gateway_postgres_tests
       tests/postgres_server_test.cpp)
