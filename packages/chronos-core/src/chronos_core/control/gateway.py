@@ -211,7 +211,11 @@ def _apply_ddl(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     from chronos_core.control.ddl import apply_shared_ddl
 
     store, sql = _store(c, a), _text(a, "sql")
-    return lambda ws: apply_shared_ddl(ws, store, sql)
+    search_path = a.get("search_path") or None
+    if search_path is not None and (not isinstance(search_path, list)
+                                    or not all(isinstance(item, str) for item in search_path)):
+        raise ControlError(400, "search_path must be a list of schema names")
+    return lambda ws: apply_shared_ddl(ws, store, sql, search_path)
 
 
 def _create_index(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
@@ -236,7 +240,7 @@ _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[st
     "table_info": (_table_info, frozenset({"store", "table"}), 200, False),
     "create_index": (_create_index, frozenset({"store", "table", "columns", "name"}), 201, False),
     # CREATE TABLE / CREATE INDEX from SQL clients of a shared-structure workspace.
-    "apply_ddl": (_apply_ddl, frozenset({"store", "sql"}), 200, False),
+    "apply_ddl": (_apply_ddl, frozenset({"store", "sql", "search_path"}), 200, False),
 }
 
 

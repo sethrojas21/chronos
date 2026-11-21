@@ -233,3 +233,47 @@ def test_shared_structure_ddl_creates_and_registers_for_every_branch(tmp_path: P
 def test_apply_ddl_is_refused_with_branch_local_schema(control: GatewayControl) -> None:
     status, body = _call(control, "apply_ddl", store="app", sql="CREATE TABLE t (id TEXT PRIMARY KEY)")
     assert status == 400 and "shared table structure" in body["error"]
+
+
+@pytest.fixture
+def postgres_url() -> Any:
+    """A fresh PostgreSQL database, when CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL names a server."""
+    import os
+    from urllib.parse import urlsplit, urlunsplit
+    from uuid import uuid4
+
+    admin_url = os.environ.get("CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL")
+    if not admin_url:
+        pytest.skip("Set CHRONOS_CLI_TEST_POSTGRES_ADMIN_URL to test PostgreSQL schemas")
+    psycopg = pytest.importorskip("psycopg")
+    name = f"chronos_schema_test_{uuid4().hex}"
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{name}"')
+        try:
+            yield urlunsplit(urlsplit(admin_url)._replace(path=f"/{name}"))
+        finally:
+            admin.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+
+
+def test_shared_structure_schemas_and_search_path(postgres_url: str) -> None:
+    workspace = {"schema_branching": False, "stores": {"app": {"data_url": postgres_url}}}
+    control = GatewayControl(json.dumps({"workspaces": {"shared": workspace}}))
+    try:
+        ddl = partial(_call, control, "apply_ddl", workspace="shared", store="app")
+        assert ddl(sql='CREATE SCHEMA "ws1"') == (200, {"tag": "CREATE SCHEMA", "created": True})
+        assert ddl(sql='CREATE SCHEMA IF NOT EXISTS "ws1"') == (200, {"tag": "CREATE SCHEMA", "created": False})
+        status, body = ddl(sql='CREATE SCHEMA "ws1"')
+        assert status == 400 and body["sqlstate"] == "42P06"
+
+        # An explicitly qualified table, and an unqualified one placed by search_path.
+        assert ddl(sql='CREATE TABLE "ws1"."heavenbase_backend" ("provider" TEXT PRIMARY KEY)')[0] == 200
+        assert ddl(sql='CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)', search_path=["ws1", "public"])[0] == 200
+        assert ddl(sql='CREATE INDEX notes_body ON notes (body)', search_path=["ws1"])[0] == 200
+        for table in ("ws1.heavenbase_backend", "ws1.notes"):
+            status, info = _call(control, "table_info", workspace="shared", store="app", table=table)
+            assert status == 200 and info["registered"], (table, info)
+        _, info = _call(control, "table_info", workspace="shared", store="app", table="ws1.notes")
+        assert [index["name"] for index in info["indexes"]] == ["notes_body"]
+        assert not _call(control, "table_info", workspace="shared", store="app", table="notes")[1]["registered"]
+    finally:
+        control.close()

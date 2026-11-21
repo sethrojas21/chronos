@@ -39,6 +39,12 @@ class CreateTable:
 
 
 @dataclass(frozen=True)
+class CreateSchema:
+    schema: str
+    if_not_exists: bool
+
+
+@dataclass(frozen=True)
 class CreateIndex:
     table: str
     columns: tuple[str, ...]
@@ -46,8 +52,12 @@ class CreateIndex:
     if_not_exists: bool
 
 
-def parse_shared_ddl(sql: str) -> CreateTable | CreateIndex:
-    """Read one CREATE TABLE or CREATE INDEX; refuse anything else."""
+def parse_shared_ddl(sql: str, search_path: list[str] | None = None) -> CreateTable | CreateIndex | CreateSchema:
+    """Read one CREATE SCHEMA, CREATE TABLE, or CREATE INDEX; refuse anything else.
+
+    An unqualified CREATE TABLE is placed in the first schema of search_path,
+    as PostgreSQL does; the returned sql then names that schema.
+    """
     import sqlglot
     from sqlglot import exp
 
@@ -60,10 +70,20 @@ def parse_shared_ddl(sql: str) -> CreateTable | CreateIndex:
     statement = statements[0]
     kind = str(statement.args.get("kind") or "").upper()
     if_not_exists = bool(statement.args.get("exists"))
+    if kind == "SCHEMA":
+        target = statement.this
+        name = target.args["db"].name if isinstance(target, exp.Table) and target.args.get("db") else ""
+        if not name:
+            raise SharedDDLError("CREATE SCHEMA needs a schema name")
+        return CreateSchema(name, if_not_exists)
     if kind == "TABLE":
         schema = statement.this
         if not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
             raise SharedDDLError("CREATE TABLE ... AS and other forms without columns are not supported")
+        current = _current_schema(search_path)
+        if current is not None and not schema.this.args.get("db"):
+            schema.this.set("db", exp.to_identifier(current, quoted=True))
+            sql = statement.sql(dialect="postgres")
         table = _table_name(schema.this)
         primary_key: list[str] = []
         for item in schema.expressions:
@@ -97,13 +117,22 @@ def parse_shared_ddl(sql: str) -> CreateTable | CreateIndex:
     raise SharedDDLError(_SHARED_ONLY)
 
 
-def apply_shared_ddl(workspace: ChronosWorkspaceContext, store: str, sql: str) -> dict[str, Any]:
-    """Create and register a table, or create an index, for every branch.
+def apply_shared_ddl(workspace: ChronosWorkspaceContext, store: str, sql: str,
+                     search_path: list[str] | None = None) -> dict[str, Any]:
+    """Create a schema, create and register a table, or create an index, for every branch.
 
+    search_path is the client connection's, used for unqualified names.
     Returns {"tag": command tag, "created": bool}; IF NOT EXISTS on an existing
-    table or index returns created False.
+    schema, table, or index returns created False.
     """
-    statement = parse_shared_ddl(sql)
+    statement = parse_shared_ddl(sql, search_path)
+    if isinstance(statement, CreateSchema):
+        return _create_schema(workspace, store, statement)
+    if "." in statement.table:
+        _require_schemas(workspace, store)
+    if isinstance(statement, CreateIndex):
+        statement = CreateIndex(_resolve(workspace, store, statement.table, search_path), statement.columns,
+                                statement.name, statement.if_not_exists)
     info = operations.table_info(workspace, store, statement.table)
     if isinstance(statement, CreateTable):
         if info.registered:
@@ -134,7 +163,47 @@ _SHARED_ONLY = (
 
 
 def _table_name(table: Any) -> str:
+    """The registered name: "schema.table" in a schema other than public."""
     schema = table.args.get("db")
     if schema is not None and schema.name not in ("", "public"):
-        raise SharedDDLError("PostgreSQL schemas are not supported; use table-name prefixes")
+        return f"{schema.name}.{table.name}"
     return table.name
+
+
+def _current_schema(search_path: list[str] | None) -> str | None:
+    """Where an unqualified CREATE TABLE goes: the first schema, unless public."""
+    for schema in search_path or ():
+        return None if schema == "public" else schema
+    return None
+
+
+def _resolve(workspace: ChronosWorkspaceContext, store: str, table: str, search_path: list[str] | None) -> str:
+    """The registered table an unqualified name means, as the engine resolves it."""
+    if "." in table or not search_path:
+        return table
+    for schema in search_path:
+        candidate = table if schema == "public" else f"{schema}.{table}"
+        if operations.table_info(workspace, store, candidate).registered:
+            return candidate
+    return table
+
+
+def _require_schemas(workspace: ChronosWorkspaceContext, store: str) -> None:
+    if getattr(workspace.stores[store].db, "dialect", None) != "postgres":
+        raise SharedDDLError("schemas need a PostgreSQL store")
+
+
+def _create_schema(workspace: ChronosWorkspaceContext, store: str, statement: CreateSchema) -> dict[str, Any]:
+    """A schema is a namespace shared by every branch; it is not versioned."""
+    _require_schemas(workspace, store)
+    database = workspace.stores[store]
+    exists = database.db.execute(
+        "SELECT 1 FROM information_schema.schemata WHERE schema_name = ?", (statement.schema,)).fetchall()
+    if exists:
+        if statement.if_not_exists:
+            return {"tag": "CREATE SCHEMA", "created": False}
+        raise SharedDDLError(f'schema "{statement.schema}" already exists', "42P06")
+    quoted = '"' + statement.schema.replace('"', '""') + '"'
+    database.db.execute(f"CREATE SCHEMA {quoted}")
+    database.db.commit()
+    return {"tag": "CREATE SCHEMA", "created": True}
