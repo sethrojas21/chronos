@@ -3729,6 +3729,46 @@ struct NativeTableMeta {
     bool has_schema_binding = false;
 };
 
+// The PostgreSQL type OID of a stored column definition such as
+// "\"value\" TEXT COLLATE \"C\" NOT NULL": the column name and trailing
+// clauses are skipped, so a name or default containing "json" is not JSON.
+std::uint32_t declared_column_type_oid(const std::string &definition) {
+    std::size_t start = 0;
+    if (!definition.empty() && definition[0] == '"') {
+        start = 1;
+        while (start < definition.size()) {
+            if (definition[start] == '"' && start + 1 < definition.size() && definition[start + 1] == '"') {
+                start += 2;
+                continue;
+            }
+            if (definition[start] == '"') { ++start; break; }
+            ++start;
+        }
+    } else {
+        start = definition.find(' ');
+        if (start == std::string::npos) return 0;
+    }
+    std::string type = definition.substr(start);
+    std::string upper = type;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    std::size_t end = upper.size();
+    for (const char *clause : {" NOT ", " NULL", " DEFAULT", " COLLATE", " PRIMARY", " REFERENCES",
+                               " CHECK", " UNIQUE", " CONSTRAINT", " GENERATED"}) {
+        const auto at = upper.find(clause);
+        if (at != std::string::npos && at < end) end = at;
+    }
+    return pg_type_for_declared_type(type.substr(0, end).c_str());
+}
+
+std::vector<std::uint32_t> declared_column_types(const NativeTableMeta &meta) {
+    std::vector<std::uint32_t> types;
+    if (meta.column_defs.size() != meta.columns.size()) return types;
+    for (const auto &definition : meta.column_defs) types.push_back(declared_column_type_oid(definition));
+    return types;
+}
+
 struct NativeDirectMergeSegment {
     std::int64_t segment_id = 0;
     std::int64_t parent_segment_id = 0;

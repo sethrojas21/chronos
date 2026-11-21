@@ -128,6 +128,10 @@ struct NativeRowDiff {
     std::vector<IntervalValue> after;
     bool has_before = false;
     bool has_after = false;
+    // PostgreSQL type OID per entry of columns, from the table's declared
+    // types; empty when unknown. Lets JSON columns decode while TEXT that
+    // looks like JSON stays byte for byte.
+    std::vector<std::uint32_t> column_types;
 };
 
 struct NativeMergePreview {

@@ -4303,6 +4303,7 @@
         diff.key_columns = meta.pk_columns;
         diff.key_values = key.values;
         diff.columns = meta.columns;
+        diff.column_types = declared_column_types(meta);
         if (left_row != nullptr) {
             diff.has_before = true;
             diff.before = *left_row;
@@ -4336,6 +4337,7 @@
             diff.key_columns = meta.pk_columns;
             diff.key_values = key.values;
             diff.columns = meta.columns;
+            diff.column_types = declared_column_types(meta);
             diff.has_before = true;
             diff.before = *before;
             diff.has_after = true;

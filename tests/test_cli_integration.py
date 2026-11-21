@@ -573,6 +573,26 @@ class TestWorkspaceSQLWorkflows:
         assert _invoke_workspace(config, "branch", "list") == ["main"]
 
     @pytest.mark.parametrize("atomic", [False, True], ids=["coordinated", "atomic"])
+    def test_merges_keep_text_that_looks_like_json_byte_for_byte(
+        self, cli_database: DatabaseConfig, tmp_path: Path, atomic: bool,
+    ) -> None:
+        """A merge copies TEXT unchanged; atomic merges used to re-encode JSON-looking text."""
+        config = _workspace_config_file(tmp_path, cli_database, atomic=atomic)
+        invoke = partial(_invoke_workspace, config)
+        invoke("table", "create", "CREATE TABLE seq (key TEXT PRIMARY KEY, value TEXT)", "--store", "app")
+        invoke("table", "register", "seq", "--primary-key", "key", "--store", "app")
+        invoke("upsert", "seq", json.dumps([{"key": "writes", "value": '{"name":"writes","value":23}'}]), "--store", "app")
+        invoke("branch", "create", "agent")
+        compact = '{"name":"writes","value":24}'
+        invoke("upsert", "seq", json.dumps([{"key": "writes", "value": compact}]), "--store", "app", "--branch", "agent")
+        assert invoke("diff", "main", "agent")["app"]["changes"][0]["after"]["value"] == compact
+        if atomic:
+            invoke("merge", "atomic-apply", "agent", "main", "--operation-id", f"seq-{uuid4()}")
+        else:
+            invoke("merge", "apply", "agent", "main")
+        assert invoke("query", "SELECT value FROM seq", "--store", "app") == [{"value": compact}]
+
+    @pytest.mark.parametrize("atomic", [False, True], ids=["coordinated", "atomic"])
     def test_keep_branch_merge_for_a_long_lived_agent_branch(
         self, cli_database: DatabaseConfig, tmp_path: Path, atomic: bool,
     ) -> None:

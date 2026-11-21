@@ -426,27 +426,35 @@ py::dict prepared_ref_info_to_py(const NativePreparedRefInfo &info) {
     return out;
 }
 
+// types: the type OID per column name (see NativeRowDiff::column_types);
+// a column without one keeps the untyped conversion.
 py::dict row_values_to_py_dict(
     const std::vector<std::string> &columns,
-    const std::vector<IntervalValue> &values
+    const std::vector<IntervalValue> &values,
+    const std::unordered_map<std::string, std::uint32_t> &types = {}
 ) {
     py::dict out;
     for (std::size_t i = 0; i < columns.size() && i < values.size(); ++i) {
-        out[columns[i].c_str()] = value_to_py(values[i]);
+        const auto found = types.find(columns[i]);
+        out[columns[i].c_str()] = value_to_py(values[i], found == types.end() ? kUntypedColumn : found->second);
     }
     return out;
 }
 
 py::dict row_diff_to_py(const NativeRowDiff &diff) {
+    std::unordered_map<std::string, std::uint32_t> types;
+    for (std::size_t i = 0; i < diff.columns.size() && i < diff.column_types.size(); ++i) {
+        types.emplace(diff.columns[i], diff.column_types[i]);
+    }
     py::dict out;
     out["table"] = diff.table;
-    out["key"] = row_values_to_py_dict(diff.key_columns, diff.key_values);
+    out["key"] = row_values_to_py_dict(diff.key_columns, diff.key_values, types);
     out["change"] = diff.change;
     out["before"] = diff.has_before
-        ? row_values_to_py_dict(diff.columns, diff.before)
+        ? row_values_to_py_dict(diff.columns, diff.before, types)
         : py::object(py::none());
     out["after"] = diff.has_after
-        ? row_values_to_py_dict(diff.columns, diff.after)
+        ? row_values_to_py_dict(diff.columns, diff.after, types)
         : py::object(py::none());
     return out;
 }
