@@ -255,6 +255,14 @@ class NativeBranchSessionImpl {
         branch_private_guard_cache_.reset();
     }
 
+    // Schemas searched, in order, for an unqualified table name; "public"
+    // means the unqualified registered name. Empty (the default) leaves names
+    // exactly as written, as before search paths existed.
+    void set_search_path(std::vector<std::string> schemas) {
+        search_path_ = std::move(schemas);
+        select_rewrite_cache_.clear();
+    }
+
   private:
     // Acquire the branch write guard once for an autocommit statement.  Nested
     // helpers (e.g. execute_update -> upsert_rows) observe the active flag and
@@ -420,6 +428,29 @@ class NativeBranchSessionImpl {
         return inserted.first->second;
     }
 
+    // The registered table an unqualified name means under the search path:
+    // the first schema holding it wins. Qualified or unmatched names are
+    // returned unchanged.
+    std::string resolve_table_name(const std::string &name, bool reread_on_miss = true) {
+        if (search_path_.empty() || name.find('.') != std::string::npos) return name;
+        auto registered_match = [&]() -> std::optional<std::string> {
+            const auto &metas = table_metas_for_session();
+            for (const auto &schema : search_path_) {
+                const std::string candidate = schema == "public" ? name : schema + "." + name;
+                for (const auto &meta : metas) {
+                    if (meta.logical_name == candidate) return candidate;
+                }
+            }
+            return std::nullopt;
+        };
+        if (auto found = registered_match()) return *found;
+        if (!reread_on_miss) return name;
+        // A table registered by another process since the registry was read.
+        reload_table_registry();
+        if (auto found = registered_match()) return *found;
+        return name;
+    }
+
     std::unordered_map<std::string, std::string> visible_table_replacements() {
         std::unordered_map<std::string, std::string> replacements;
         for (const auto &meta : table_metas_for_session()) {
@@ -433,6 +464,18 @@ class NativeBranchSessionImpl {
                 "SELECT " + cols + " FROM " + quote_ident(meta.physical_name) +
                     " WHERE " + visible_select_where_sql(segment_.branch_point, store_.dialect())
             );
+        }
+        if (!search_path_.empty()) {
+            // An unqualified name reads the table the search path selects.
+            std::vector<std::string> unqualified;
+            for (const auto &meta : table_metas_for_session()) {
+                const auto dot = meta.logical_name.find('.');
+                if (dot != std::string::npos) unqualified.push_back(meta.logical_name.substr(dot + 1));
+            }
+            for (const auto &name : unqualified) {
+                const std::string chosen = resolve_table_name(name, false);
+                if (chosen != name) replacements[name] = replacements.at(chosen);
+            }
         }
         return replacements;
     }
@@ -588,7 +631,8 @@ class NativeBranchSessionImpl {
         return names;
     }
 
-    NativeTableMeta table_meta_for(const std::string &logical_table) {
+    NativeTableMeta table_meta_for(const std::string &written_table) {
+        const std::string logical_table = resolve_table_name(written_table);
         auto found = table_meta_by_name_.find(logical_table);
         if (found != table_meta_by_name_.end()) {
             return found->second;
@@ -2574,6 +2618,7 @@ class NativeBranchSessionImpl {
     std::optional<bool> branch_private_guard_cache_;
     std::unordered_map<std::string, NativeTableMeta> table_meta_by_name_;
     std::unordered_map<std::string, std::string> select_rewrite_cache_;
+    std::vector<std::string> search_path_;
 };
 
 } // namespace chronos::native

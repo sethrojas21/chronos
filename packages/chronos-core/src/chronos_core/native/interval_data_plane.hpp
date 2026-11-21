@@ -62,6 +62,10 @@ class NativeBranchSession {
     // Result columns and parameter types of a SELECT, without running it.
     IntervalStatementDescription describe(const std::string &sql);
     std::string rewrite_query(const std::string &sql);
+    // Schemas searched, in order, for unqualified table names in queries and
+    // DML ("public" is the unqualified registered name). Empty: names are
+    // used as written.
+    void set_search_path(std::vector<std::string> schemas);
     std::int64_t execute(
         const std::string &sql,
         const std::vector<IntervalValue> &params = {}

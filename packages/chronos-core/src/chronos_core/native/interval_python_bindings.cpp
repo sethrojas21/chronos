@@ -555,6 +555,10 @@ IntervalStatementDescription NativeBranchSession::describe(const std::string &sq
             std::move(description.parameter_types)};
 }
 
+void NativeBranchSession::set_search_path(std::vector<std::string> schemas) {
+    impl_->set_search_path(std::move(schemas));
+}
+
 std::string NativeBranchSession::rewrite_query(const std::string &sql) {
     return impl_->rewrite_query(sql);
 }
