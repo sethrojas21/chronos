@@ -131,8 +131,12 @@ def apply_shared_ddl(workspace: ChronosWorkspaceContext, store: str, sql: str,
     if "." in statement.table:
         _require_schemas(workspace, store)
     if isinstance(statement, CreateIndex):
-        statement = CreateIndex(_resolve(workspace, store, statement.table, search_path), statement.columns,
-                                statement.name, statement.if_not_exists)
+        table = _resolve(workspace, store, statement.table, search_path)
+        name = statement.name
+        if name is not None and "." in table:
+            # PostgreSQL index names are per schema; Chronos's are global.
+            name = f"{table.split('.', 1)[0]}.{name}"
+        statement = CreateIndex(table, statement.columns, name, statement.if_not_exists)
     info = operations.table_info(workspace, store, statement.table)
     if isinstance(statement, CreateTable):
         if info.registered:

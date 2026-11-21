@@ -273,7 +273,12 @@ def test_shared_structure_schemas_and_search_path(postgres_url: str) -> None:
             status, info = _call(control, "table_info", workspace="shared", store="app", table=table)
             assert status == 200 and info["registered"], (table, info)
         _, info = _call(control, "table_info", workspace="shared", store="app", table="ws1.notes")
-        assert [index["name"] for index in info["indexes"]] == ["notes_body"]
+        assert [index["name"] for index in info["indexes"]] == ["ws1.notes_body"]
+        # The same index name in another schema is a different index, as in PostgreSQL.
+        assert ddl(sql='CREATE SCHEMA ws2')[0] == 200
+        assert ddl(sql='CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)', search_path=["ws2"])[0] == 200
+        assert ddl(sql='CREATE INDEX notes_body ON notes (body)', search_path=["ws2"]) == (
+            200, {"tag": "CREATE INDEX", "created": True})
         assert not _call(control, "table_info", workspace="shared", store="app", table="notes")[1]["registered"]
     finally:
         control.close()
