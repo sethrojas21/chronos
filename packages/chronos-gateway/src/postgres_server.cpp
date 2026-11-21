@@ -313,10 +313,12 @@ std::string format_search_path(const std::vector<std::string> &schemas) {
     return text;
 }
 
-// The search_path in a StartupMessage's options ("-c search_path=x" or
-// "--search_path=x"), if any.
-std::optional<std::string> startup_search_path(const std::string &options) {
-    for (const std::string key : {"search_path=", "search-path="}) {
+// The value of a setting in a StartupMessage's options ("-c name=x" or
+// "--name=x"), if any. Several settings may appear, as
+// "-c search_path=x -c chronos.branch=y".
+std::optional<std::string> startup_option(const std::string &options,
+                                          const std::vector<std::string> &keys) {
+    for (const std::string &key : keys) {
         const auto at = options.find(key);
         if (at == std::string::npos) continue;
         std::size_t end = at + key.size();
@@ -334,14 +336,23 @@ std::optional<std::string> startup_search_path(const std::string &options) {
     return std::nullopt;
 }
 
+std::optional<std::string> startup_search_path(const std::string &options) {
+    return startup_option(options, {"search_path=", "search-path="});
+}
+
+std::optional<std::string> startup_branch(const std::string &options) {
+    return startup_option(options, {"chronos.branch="});
+}
+
 std::string lowercase(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return text;
 }
 
-// The value of "SET [SESSION | LOCAL] search_path {TO | =} value", if sql is one.
-std::optional<std::string> set_search_path_value(const std::string &sql) {
+// The value of "SET [SESSION | LOCAL] parameter {TO | =} value", if sql is
+// one; DEFAULT gives an empty value.
+std::optional<std::string> set_parameter_value(const std::string &sql, const std::string &parameter) {
     std::istringstream words(sql);
     std::string word;
     words >> word;
@@ -351,9 +362,16 @@ std::optional<std::string> set_search_path_value(const std::string &sql) {
     std::string target = lowercase(word);
     std::string rest;
     std::getline(words, rest);
-    // "search_path=x" may arrive as one word.
-    if (target.rfind("search_path=", 0) == 0) return target.substr(12) + rest;
-    if (target != "search_path") return std::nullopt;
+    // "parameter=x" may arrive as one word.
+    if (target.rfind(parameter + "=", 0) == 0) {
+        if (parameter == "search_path") return target.substr(parameter.size() + 1) + rest;
+        rest = word.substr(parameter.size() + 1) + rest;  // keeps the value's case
+        while (!rest.empty() && (rest.back() == ';' || std::isspace(static_cast<unsigned char>(rest.back())))) {
+            rest.pop_back();
+        }
+        return lowercase(rest) == "default" ? std::string() : rest;
+    }
+    if (target != parameter) return std::nullopt;
     auto start = rest.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) return std::string();
     if (rest[start] == '=') ++start;
@@ -367,6 +385,101 @@ std::optional<std::string> set_search_path_value(const std::string &sql) {
         return std::string();
     }
     return value;
+}
+
+std::optional<std::string> set_search_path_value(const std::string &sql) {
+    return set_parameter_value(sql, "search_path");
+}
+
+// --- chronos.branch ------------------------------------------------------------
+// A principal's connection chooses its branch at login (startup option
+// "-c chronos.branch=NAME", else the principal's default branch) and may change
+// it with SET chronos.branch outside a transaction.
+
+constexpr const char *kBranchParameter = "chronos.branch";
+
+// A branch name from a SET value: quoted names are unquoted, others are used
+// as written (branch names are case-sensitive).
+std::string branch_value(std::string value) {
+    const auto start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return {};
+    value = value.substr(start);
+    if (!value.empty() && (value.front() == '\'' || value.front() == '"')) {
+        const char quote = value.front();
+        std::string name;
+        for (std::size_t i = 1; i < value.size(); ++i) {
+            if (value[i] == quote && i + 1 < value.size() && value[i + 1] == quote) { name += quote; ++i; continue; }
+            if (value[i] == quote) return name;
+            name += value[i];
+        }
+        throw GatewayError("unterminated quoted branch name");
+    }
+    return value;
+}
+
+bool second_word_is(const std::string &sql, const std::string &expected) {
+    std::istringstream words(sql);
+    std::string first, second;
+    words >> first >> second;
+    return lowercase(second) == expected;
+}
+
+bool resets_branch(const std::string &sql) {
+    std::istringstream words(sql);
+    std::string first, second;
+    words >> first >> second;
+    while (!second.empty() && second.back() == ';') second.pop_back();
+    return lowercase(first) == "reset" && lowercase(second) == kBranchParameter;
+}
+
+// Statements a read-only branch accepts. Everything else (INSERT, UPDATE,
+// DELETE, MERGE, DDL, COPY, ...) is a write.
+bool writes_data(const std::string &sql, const std::string &keyword) {
+    static const std::vector<std::string> reads = {
+        "select", "with", "show", "set", "reset", "discard", "begin", "start",
+        "commit", "end", "rollback", "savepoint", "release", "deallocate"};
+    if (std::find(reads.begin(), reads.end(), keyword) == reads.end()) return true;
+    if (keyword != "select" && keyword != "with") return false;
+    // A query may still write: WITH ... DELETE, SELECT ... INTO. Look for
+    // such words outside quotes and comments; FOR UPDATE is only a lock.
+    std::string previous;
+    for (std::size_t i = 0; i < sql.size();) {
+        const char ch = sql[i];
+        if (ch == '\'' || ch == '"') {
+            const auto end = sql.find(ch, i + 1);
+            i = end == std::string::npos ? sql.size() : end + 1;
+            continue;
+        }
+        if (ch == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            const auto end = sql.find('\n', i);
+            i = end == std::string::npos ? sql.size() : end + 1;
+            continue;
+        }
+        if (ch == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            const auto end = sql.find("*/", i + 2);
+            i = end == std::string::npos ? sql.size() : end + 2;
+            continue;
+        }
+        if (ch == '$' && i + 1 < sql.size() && sql[i + 1] == '$') {
+            const auto end = sql.find("$$", i + 2);
+            i = end == std::string::npos ? sql.size() : end + 2;
+            continue;
+        }
+        if (std::isalpha(static_cast<unsigned char>(ch)) || ch == '_') {
+            std::string word;
+            while (i < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[i])) || sql[i] == '_')) {
+                word += static_cast<char>(std::tolower(static_cast<unsigned char>(sql[i++])));
+            }
+            if (word == "insert" || word == "delete" || word == "merge" || word == "truncate" ||
+                word == "into" || (word == "update" && previous != "for" && previous != "key")) {
+                return true;
+            }
+            previous = std::move(word);
+            continue;
+        }
+        ++i;
+    }
+    return false;
 }
 
 bool resets_search_path(const std::string &sql) {
@@ -488,13 +601,52 @@ struct Execution {
 // workspace and returns the command tag.
 using SharedDdl = std::function<std::string(const std::string &sql)>;
 
+// Replaces the connection's branch session with one on another branch;
+// nullopt returns to the branch chosen at login. The current session is gone
+// when it returns.
+using BranchSwitch = std::function<void(const std::optional<std::string> &branch)>;
+
 Execution execute_sql(SqlBranchSession &branch_session, const std::string &sql,
                       const std::vector<IntervalValue> &params,
-                      const SharedDdl &shared_ddl = {}) {
+                      const SharedDdl &shared_ddl = {},
+                      const BranchSwitch &switch_branch = {}) {
     enforce_branch_sql_boundary(sql);
-    auto &session = branch_session.session();
     const std::string keyword = lower_keyword(sql);
     if (keyword.empty()) return {false, {}, ""};
+    if (keyword == "show" && lowercase(sql).find(kBranchParameter) != std::string::npos) {
+        IntervalQueryResult result;
+        result.columns = {kBranchParameter};
+        result.rows = {{branch_session.branch()}};
+        return {true, std::move(result), {}};
+    }
+    if (keyword == "set" || keyword == "reset") {
+        std::optional<std::string> target;
+        bool changes_branch = false;
+        if (auto value = set_parameter_value(sql, kBranchParameter)) {
+            if (second_word_is(sql, "local")) {
+                throw SqlStateError("SET LOCAL chronos.branch is not supported; use SET chronos.branch", "0A000");
+            }
+            changes_branch = true;
+            if (!value->empty()) target = branch_value(*value);
+            if (target && target->empty()) throw GatewayError("branch name is required");
+        } else if (resets_branch(sql)) {
+            changes_branch = true;
+        }
+        if (changes_branch) {
+            if (branch_session.session().in_transaction()) {
+                throw SqlStateError("chronos.branch cannot be changed inside a transaction block", "25001");
+            }
+            if (!switch_branch) throw GatewayError("this connection cannot change branches");
+            // Replaces branch_session: nothing below may touch it.
+            switch_branch(target);
+            return {false, {}, keyword == "reset" ? "RESET" : "SET"};
+        }
+    }
+    if (branch_session.read_only() && writes_data(sql, keyword)) {
+        throw PermissionDenied(
+            "branch \"" + branch_session.branch() + "\" is read-only for this login");
+    }
+    auto &session = branch_session.session();
     if (!branch_session.schema_branching() &&
         (keyword == "create" || keyword == "alter" || keyword == "drop")) {
         // A branch-local definition would give this branch its own table
@@ -682,15 +834,19 @@ class PostgresServer::Impl {
             auto password_payload = read_sized_payload(socket);
             std::size_t password_offset = 0;
             const auto password = take_cstring(password_payload, password_offset);
-            auto branch_session = runtime.open_postgres(user->second, password, database->second);
-            // libpq and node-postgres send "-c search_path=..." in options.
+            // libpq and node-postgres send "-c search_path=... -c chronos.branch=..."
+            // in options; without chronos.branch a principal gets its default branch.
+            std::optional<std::string> requested_branch;
+            std::optional<std::string> search_path;
             if (const auto options = startup.find("options"); options != startup.end()) {
-                if (auto value = startup_search_path(options->second)) {
-                    branch_session->set_search_path(parse_search_path(*value));
-                }
+                requested_branch = startup_branch(options->second);
+                search_path = startup_search_path(options->second);
             }
-            const std::string workspace_name = branch_session->access_grant().workspace;
-            const std::string store_alias = database->second;
+            auto branch_session = runtime.open_postgres(
+                user->second, password, database->second, requested_branch);
+            if (search_path) branch_session->set_search_path(parse_search_path(*search_path));
+            const std::string workspace_name = branch_session->workspace();
+            const std::string store_alias = branch_session->store_alias();
             const SharedDdl shared_ddl = [this, &workspace_name, &store_alias, &branch_session](
                                              const std::string &sql) {
                 if (!python) throw GatewayError("table creation needs the gateway's Python control");
@@ -706,6 +862,10 @@ class PostgresServer::Impl {
                                                         : std::string("XX000"));
                 }
                 return body.at("tag").get<std::string>();
+            };
+            const BranchSwitch switch_branch = [this, &branch_session](const std::optional<std::string> &branch) {
+                branch_session = runtime.switch_postgres_branch(
+                    *branch_session, branch ? *branch : branch_session->startup_branch());
             };
 
             send_auth(socket, 0);
@@ -745,13 +905,13 @@ class PostgresServer::Impl {
                 try {
                     // A live connection must be invalidated immediately when
                     // its workspace expires or is revoked.
-                    runtime.access_grants().authorize_postgres(user->second, password, database->second);
+                    runtime.recheck_postgres(*branch_session, user->second, password, database->second);
                     if (ignore_until_sync && type != 'S') continue;
                     if (type == 'Q') {
                         std::size_t offset = 0;
                         const auto sql = take_cstring(payload, offset);
                         auto execution = failed_transaction_reply(lower_keyword(sql));
-                        if (!execution) execution = execute_sql(*branch_session, sql, {}, shared_ddl);
+                        if (!execution) execution = execute_sql(*branch_session, sql, {}, shared_ddl, switch_branch);
                         send_execution(socket, *execution, true);
                         failed_transaction = false;
                         send_ready(socket, branch_session->session().in_transaction() ? 'T' : 'I');
@@ -812,7 +972,7 @@ class PostgresServer::Impl {
                             // A failed transaction runs nothing; Execute reports the error.
                             if (!failed_transaction &&
                                 (keyword == "select" || keyword == "with" || keyword == "show")) {
-                                auto execution = execute_sql(*branch_session, found->second.sql, found->second.params, shared_ddl);
+                                auto execution = execute_sql(*branch_session, found->second.sql, found->second.params, shared_ddl, switch_branch);
                                 found->second.described_result = std::move(execution.rows);
                                 send_row_description(socket, *found->second.described_result);
                             } else send_message(socket, 'n', {});
@@ -830,7 +990,7 @@ class PostgresServer::Impl {
                             send_execution(socket, execution, false);
                         } else {
                             send_execution(socket, execute_sql(
-                                *branch_session, found->second.sql, found->second.params, shared_ddl), false);
+                                *branch_session, found->second.sql, found->second.params, shared_ddl, switch_branch), false);
                         }
                         // Only ROLLBACK can succeed in a failed transaction.
                         failed_transaction = false;
@@ -853,7 +1013,8 @@ class PostgresServer::Impl {
                 } catch (const std::exception &error) {
                     failed_transaction = branch_session->session().in_transaction();
                     const auto *coded = dynamic_cast<const SqlStateError *>(&error);
-                    send_error(socket, error.what(), coded ? coded->code : "0A000");
+                    const bool denied = dynamic_cast<const PermissionDenied *>(&error) != nullptr;
+                    send_error(socket, error.what(), coded ? coded->code : (denied ? "42501" : "0A000"));
                     if (type == 'Q') send_ready(socket, failed_transaction ? 'E' : 'I');
                     else ignore_until_sync = true;
                 }
@@ -861,7 +1022,8 @@ class PostgresServer::Impl {
         } catch (const boost::system::system_error &) {
             // Disconnects and stop() are ordinary session termination.
         } catch (const std::exception &error) {
-            try { send_error(*socket_ptr, error.what(), "28000"); } catch (...) {}
+            const bool denied = dynamic_cast<const PermissionDenied *>(&error) != nullptr;
+            try { send_error(*socket_ptr, error.what(), denied ? "42501" : "28000"); } catch (...) {}
         }
     }
 

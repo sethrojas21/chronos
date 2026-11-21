@@ -55,10 +55,26 @@ void GatewayRuntime::add_workspace(const std::string &name, const WorkspaceConfi
         entry->filesystem->ensure();
     }
 
+    {
+        std::lock_guard lock(workspaces_mutex_);
+        if (workspaces_.count(name)) throw GatewayError("workspace is already configured");
+    }
+    // Principals live in a gateway-owned table of the workspace's metadata
+    // database, so they survive a gateway restart.
+    principals_.attach_workspace(name, make_sql_principal_storage(control_metadata_url, name));
+
     std::lock_guard lock(workspaces_mutex_);
     if (!workspaces_.emplace(name, std::move(entry)).second) {
         throw GatewayError("workspace is already configured");
     }
+}
+
+std::vector<std::string> GatewayRuntime::postgres_store_aliases(const std::string &workspace_name) const {
+    auto target = workspace(workspace_name);
+    std::vector<std::string> aliases;
+    for (const auto &[alias, store] : target->config.postgres_stores) aliases.push_back(alias);
+    std::sort(aliases.begin(), aliases.end());
+    return aliases;
 }
 
 namespace {
@@ -215,24 +231,126 @@ AccessGrant GatewayRuntime::close_branch(
     return access_grants_.revoke(grant->id);
 }
 
-std::unique_ptr<SqlBranchSession> GatewayRuntime::open_postgres(
-    const std::string &access_id,
-    const std::string &credential,
-    const std::string &store_alias) {
-    auto grant = access_grants_.authorize_postgres(access_id, credential, store_alias);
-    auto target = workspace(grant.workspace);
-    auto found = target->config.postgres_stores.find(store_alias);
-    if (found == target->config.postgres_stores.end()) {
+std::unique_ptr<SqlBranchSession> GatewayRuntime::checkout_postgres(
+    const Workspace &target,
+    const std::string &store_alias,
+    const std::string &branch,
+    AccessGrant grant) {
+    auto found = target.config.postgres_stores.find(store_alias);
+    if (found == target.config.postgres_stores.end()) {
         throw GatewayError("authorized database is not configured");
     }
     auto store = found->second.metadata_url.empty()
         ? std::make_unique<chronos::native::NativeBranchStore>(found->second.data_url)
         : std::make_unique<chronos::native::NativeBranchStore>(
               found->second.data_url, found->second.metadata_url);
-    auto session = store->checkout(grant.branch);
+    auto session = store->checkout(branch);
     auto opened = std::make_unique<SqlBranchSession>(
         std::move(store), std::move(session), std::move(grant));
-    opened->set_schema_branching(target->config.schema_branching);
+    opened->set_schema_branching(target.config.schema_branching);
+    opened->store_alias_ = store_alias;
+    opened->startup_branch_ = branch;
+    return opened;
+}
+
+std::unique_ptr<SqlBranchSession> GatewayRuntime::open_postgres(
+    const std::string &user,
+    const std::string &credential,
+    const std::string &database,
+    const std::optional<std::string> &requested_branch) {
+    // Access grants are checked first; principal names never have a grant
+    // id's shape, so a user names at most one of the two.
+    if (!access_grants_.get(user)) {
+        std::string workspace_name;
+        std::string store_alias = database;
+        if (const auto slash = database.find('/'); slash != std::string::npos) {
+            workspace_name = database.substr(0, slash);
+            store_alias = database.substr(slash + 1);
+        }
+        std::vector<std::shared_ptr<Workspace>> candidates;
+        std::vector<std::string> candidate_names;
+        {
+            std::lock_guard lock(workspaces_mutex_);
+            for (const auto &[name, entry] : workspaces_) {
+                if (!workspace_name.empty() && name != workspace_name) continue;
+                if (!entry->config.postgres_stores.count(store_alias)) continue;
+                candidates.push_back(entry);
+                candidate_names.push_back(name);
+            }
+        }
+        std::optional<std::size_t> chosen;
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            if (!principals_.get(candidate_names[index], user)) continue;
+            if (chosen) {
+                throw GatewayError(
+                    "login name exists in several workspaces; connect to database "
+                    "\"workspace/" + store_alias + "\"");
+            }
+            chosen = index;
+        }
+        if (chosen) {
+            const auto &name = candidate_names[*chosen];
+            const auto login = principals_.authenticate(name, user, credential);
+            const auto branch = requested_branch ? *requested_branch : login.principal.default_branch;
+            const auto access = principals_.check(name, user, login.credential_version, branch);
+            AccessGrant grant;
+            grant.workspace = name;
+            grant.branch = branch;
+            grant.postgres_stores = {store_alias};
+            grant.state = AccessGrantState::Active;
+            grant.owns_branch = false;
+            grant.expires_at = std::chrono::system_clock::time_point::max();
+            auto opened = checkout_postgres(*candidates[*chosen], store_alias, branch, std::move(grant));
+            opened->principal_ = user;
+            opened->credential_version_ = login.credential_version;
+            opened->read_only_ = access == BranchAccess::ReadOnly;
+            return opened;
+        }
+    }
+    auto grant = access_grants_.authorize_postgres(user, credential, database);
+    if (requested_branch && *requested_branch != grant.branch) {
+        throw PermissionDenied(
+            "this access grant is bound to branch \"" + grant.branch + "\"");
+    }
+    auto target = workspace(grant.workspace);
+    const auto branch = grant.branch;
+    return checkout_postgres(*target, database, branch, std::move(grant));
+}
+
+void GatewayRuntime::recheck_postgres(
+    SqlBranchSession &session,
+    const std::string &user,
+    const std::string &credential,
+    const std::string &database) {
+    if (!session.principal()) {
+        access_grants_.authorize_postgres(user, credential, database);
+        return;
+    }
+    const auto access = principals_.check(
+        session.workspace(), *session.principal(), session.credential_version(), session.branch());
+    session.set_read_only(access == BranchAccess::ReadOnly);
+}
+
+std::unique_ptr<SqlBranchSession> GatewayRuntime::switch_postgres_branch(
+    const SqlBranchSession &current,
+    const std::string &branch) {
+    if (!current.principal()) {
+        throw PermissionDenied(
+            "this access grant is bound to branch \"" + current.branch() +
+            "\"; log in as a principal to change branches");
+    }
+    if (branch.empty()) throw GatewayError("branch name is required");
+    const auto access = principals_.check(
+        current.workspace(), *current.principal(), current.credential_version(), branch);
+    auto target = workspace(current.workspace());
+    AccessGrant grant = current.access_grant();
+    grant.branch = branch;
+    auto opened = checkout_postgres(*target, current.store_alias(), branch, std::move(grant));
+    opened->principal_ = current.principal_;
+    opened->credential_version_ = current.credential_version_;
+    opened->startup_branch_ = current.startup_branch_;
+    opened->read_only_ = access == BranchAccess::ReadOnly;
+    if (!current.search_path().empty()) opened->set_search_path(current.search_path());
     return opened;
 }
 

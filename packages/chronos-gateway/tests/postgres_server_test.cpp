@@ -121,6 +121,182 @@ void expect_command(
           message + ": command tag differs: " + PQcmdStatus(result.get()));
 }
 
+Connection connect_once(std::uint16_t port, const std::string &user, const std::string &password,
+                        const std::string &database, const std::string &options = "") {
+    std::string info = "host=127.0.0.1 port=" + std::to_string(port) + " user=" + user +
+        " password=" + password + " dbname='" + database + "' sslmode=disable connect_timeout=2";
+    if (!options.empty()) info += " options='" + options + "'";
+    return Connection(PQconnectdb(info.c_str()));
+}
+
+void expect_sqlstate(PGconn *connection, const std::string &sql, const std::string &code,
+                     const std::string &message) {
+    auto result = execute(connection, sql);
+    const char *state = PQresultErrorField(result.get(), PG_DIAG_SQLSTATE);
+    check(PQresultStatus(result.get()) == PGRES_FATAL_ERROR && state && std::string(state) == code,
+          message + ": expected SQLSTATE " + code + ", got " + (state ? state : "none") + ": " +
+              PQresultErrorMessage(result.get()));
+}
+
+// Stable logins: a principal logs in by name and password, lands on its
+// default branch (or the startup option chronos.branch), may switch with SET
+// chronos.branch, and is refused other branches and writes to read-only ones.
+void test_principals(GatewayRuntime &runtime, std::uint16_t port, const std::string &data,
+                     const std::string &metadata, const std::string &grant_id,
+                     const std::string &grant_secret) {
+    for (const std::string branch : {"agent/7", "scratch/a", "other"}) {
+        CreateBranchRequest lasting;
+        lasting.workspace = "training";
+        lasting.from_branch = "main";
+        lasting.branch_id = branch;
+        lasting.sandbox = false;
+        lasting.ttl = std::nullopt;
+        runtime.create_branch(lasting);
+    }
+    chronos::gateway::PrincipalSpec spec;
+    spec.name = "agent-7";
+    spec.default_branch = "agent/7";
+    spec.branches = {"agent/7", "scratch/*"};
+    spec.read_only_branches = {"main"};
+    auto issued = runtime.principals().create("training", spec);
+    const auto &password = issued.password;
+
+    // Login with name and password only lands on the default branch.
+    auto agent = connect(port, "agent-7", password, "orders");
+    check(PQstatus(agent.get()) == CONNECTION_OK, PQerrorMessage(agent.get()));
+    expect_cell(agent.get(), "SHOW chronos.branch", 0, 0, "agent/7", "a principal lands on its default branch");
+    expect_command(agent.get(),
+                   "INSERT INTO orders (id, customer_id, state, amount, note) VALUES (700, 10, 'agent', 1, NULL)",
+                   "INSERT 0 1", "a principal writes its own branch");
+    expect_cell(agent.get(), "SELECT count(*) FROM orders WHERE id = 700", 0, 0, "1",
+                "the write is visible on the branch");
+
+    // HeavenBase sends only search_path in options: still the default branch.
+    {
+        auto pathed = connect_once(port, "agent-7", password, "orders", "-c search_path=public");
+        check(PQstatus(pathed.get()) == CONNECTION_OK, PQerrorMessage(pathed.get()));
+        expect_cell(pathed.get(), "SHOW chronos.branch", 0, 0, "agent/7",
+                    "search_path alone keeps the default branch");
+        expect_cell(pathed.get(), "SHOW search_path", 0, 0, "public", "search_path still applies");
+    }
+
+    // Both settings in options; main is read-only for this principal.
+    auto reader = connect_once(port, "agent-7", password, "training/orders",
+                               "-c search_path=public -c chronos.branch=main");
+    check(PQstatus(reader.get()) == CONNECTION_OK, PQerrorMessage(reader.get()));
+    expect_cell(reader.get(), "SHOW chronos.branch", 0, 0, "main", "-c chronos.branch selects the branch");
+    expect_cell(reader.get(), "SHOW search_path", 0, 0, "public", "search_path is parsed alongside");
+    expect_cell(reader.get(), "SELECT count(*) FROM orders WHERE id = 700", 0, 0, "0",
+                "main does not see the agent's write");
+    expect_cell(reader.get(), "SELECT state FROM orders WHERE id = 1 AND state <> 'delete me' -- update", 0, 0, "open",
+                "reads work on a read-only branch; quoted and commented words are not writes");
+    expect_sqlstate(reader.get(), "INSERT INTO orders (id, customer_id, state, amount, note) "
+                                  "VALUES (701, 10, 'x', 1, NULL)", "42501", "INSERT on a read-only branch");
+    expect_sqlstate(reader.get(), "UPDATE orders SET state = 'x' WHERE id = 1", "42501",
+                    "UPDATE on a read-only branch");
+    expect_sqlstate(reader.get(), "DELETE FROM orders WHERE id = 1", "42501", "DELETE on a read-only branch");
+    expect_sqlstate(reader.get(), "CREATE TABLE ro_probe (id INTEGER PRIMARY KEY)", "42501",
+                    "DDL on a read-only branch");
+    expect_sqlstate(reader.get(), "WITH gone AS (DELETE FROM orders WHERE id = 1 RETURNING id) SELECT * FROM gone",
+                    "42501", "a data-modifying WITH on a read-only branch");
+    {
+        Result prepared(PQexecParams(reader.get(), "DELETE FROM orders WHERE id = $1", 1, nullptr,
+                                     std::array<const char *, 1>{"1"}.data(), nullptr, nullptr, 0));
+        const char *state = PQresultErrorField(prepared.get(), PG_DIAG_SQLSTATE);
+        check(state && std::string(state) == "42501", "extended-protocol writes on a read-only branch are refused");
+    }
+    expect_cell(reader.get(), "SELECT state FROM orders WHERE id = 1", 0, 0, "open",
+                "a refused write changes nothing");
+
+    // A branch outside the principal's patterns is refused at login.
+    {
+        auto denied = connect_once(port, "agent-7", password, "orders", "-c chronos.branch=other");
+        check(PQstatus(denied.get()) == CONNECTION_BAD &&
+                  std::string(PQerrorMessage(denied.get())).find("permission denied for branch") != std::string::npos,
+              std::string("a denied startup branch must fail: ") + PQerrorMessage(denied.get()));
+        auto wrong = connect_once(port, "agent-7", "wrong", "orders");
+        check(PQstatus(wrong.get()) == CONNECTION_BAD, "a wrong password must fail");
+        auto nobody = connect_once(port, "nobody", password, "orders");
+        check(PQstatus(nobody.get()) == CONNECTION_BAD, "an unknown name must fail");
+    }
+
+    // SET chronos.branch switches outside a transaction only.
+    expect_command(agent.get(), "SET chronos.branch = 'scratch/a'", "SET", "SET switches to an allowed branch");
+    expect_cell(agent.get(), "SHOW chronos.branch", 0, 0, "scratch/a", "SHOW reports the new branch");
+    expect_cell(agent.get(), "SELECT count(*) FROM orders WHERE id = 700", 0, 0, "0",
+                "the new branch has its own data");
+    expect_sqlstate(agent.get(), "SET chronos.branch = 'other'", "42501", "SET to a denied branch");
+    expect_cell(agent.get(), "SHOW chronos.branch", 0, 0, "scratch/a", "a denied SET keeps the branch");
+    expect_command(agent.get(), "BEGIN", "BEGIN", "a transaction begins");
+    expect_sqlstate(agent.get(), "SET chronos.branch = 'agent/7'", "25001", "SET inside a transaction");
+    expect_command(agent.get(), "ROLLBACK", "ROLLBACK", "the failed transaction rolls back");
+    expect_cell(agent.get(), "SHOW chronos.branch", 0, 0, "scratch/a", "SET inside a transaction changes nothing");
+    expect_command(agent.get(), "SET chronos.branch TO main", "SET", "SET TO an unquoted name");
+    expect_sqlstate(agent.get(), "DELETE FROM orders WHERE id = 1", "42501", "a switched read-only branch refuses writes");
+    expect_command(agent.get(), "RESET chronos.branch", "RESET", "RESET returns to the login branch");
+    expect_cell(agent.get(), "SELECT count(*) FROM orders WHERE id = 700", 0, 0, "1",
+                "RESET returns to the default branch's data");
+
+    // A grant connection is bound to its branch.
+    {
+        auto granted = connect_once(port, grant_id, grant_secret, "orders", "-c chronos.branch=rollout-wire");
+        check(PQstatus(granted.get()) == CONNECTION_OK, PQerrorMessage(granted.get()));
+        expect_cell(granted.get(), "SHOW chronos.branch", 0, 0, "rollout-wire", "a grant reports its branch");
+        expect_sqlstate(granted.get(), "SET chronos.branch = 'main'", "42501", "a grant cannot switch branches");
+        auto elsewhere = connect_once(port, grant_id, grant_secret, "orders", "-c chronos.branch=main");
+        check(PQstatus(elsewhere.get()) == CONNECTION_BAD, "a grant cannot log in to another branch");
+    }
+
+    // Narrowing permissions applies to open connections.
+    auto scratch = connect_once(port, "agent-7", password, "orders", "-c chronos.branch=scratch/a");
+    check(PQstatus(scratch.get()) == CONNECTION_OK, PQerrorMessage(scratch.get()));
+    chronos::gateway::PrincipalUpdate narrow;
+    narrow.branches = std::vector<std::string>{"agent/7"};
+    runtime.principals().update("training", "agent-7", narrow);
+    expect_sqlstate(scratch.get(), "SELECT 1", "42501", "a removed branch is refused on the next statement");
+
+    // Rotation: the old password stops working, also for open connections.
+    auto rotated = runtime.principals().rotate("training", "agent-7");
+    auto old_login = connect_once(port, "agent-7", password, "orders");
+    check(PQstatus(old_login.get()) == CONNECTION_BAD, "the old password must fail after rotation");
+    check(PQresultStatus(execute(agent.get(), "SELECT 1").get()) == PGRES_FATAL_ERROR,
+          "rotation ends connections made with the old password");
+    auto fresh = connect_once(port, "agent-7", rotated.password, "orders");
+    check(PQstatus(fresh.get()) == CONNECTION_OK, PQerrorMessage(fresh.get()));
+    expect_cell(fresh.get(), "SHOW chronos.branch", 0, 0, "agent/7", "the new password logs in");
+
+    // A restarted gateway (a new runtime on the same metadata) keeps principals.
+    {
+        GatewayRuntime restarted;
+        WorkspaceConfig workspace;
+        workspace.postgres_stores.emplace("orders", StoreConfig{data, metadata});
+        restarted.add_workspace("training", workspace);
+        const auto restarted_port = unused_port();
+        PostgresServer restarted_server(restarted, ListenAddress{"127.0.0.1", restarted_port});
+        std::thread restarted_thread([&] { restarted_server.run(); });
+        auto again = connect(restarted_port, "agent-7", rotated.password, "orders");
+        check(PQstatus(again.get()) == CONNECTION_OK,
+              std::string("a principal survives a restart: ") + PQerrorMessage(again.get()));
+        expect_cell(again.get(), "SHOW chronos.branch", 0, 0, "agent/7", "the default branch survives a restart");
+        expect_cell(again.get(), "SELECT count(*) FROM orders WHERE id = 700", 0, 0, "1",
+                    "the restarted login reads its branch");
+        auto stale = connect_once(restarted_port, "agent-7", password, "orders");
+        check(PQstatus(stale.get()) == CONNECTION_BAD, "a rotated password stays invalid after a restart");
+        again.reset();
+        stale.reset();
+        restarted_server.stop();
+        restarted_thread.join();
+    }
+
+    runtime.principals().remove("training", "agent-7");
+    check(PQresultStatus(execute(fresh.get(), "SELECT 1").get()) == PGRES_FATAL_ERROR,
+          "deleting a principal ends its connections");
+    auto deleted = connect_once(port, "agent-7", rotated.password, "orders");
+    check(PQstatus(deleted.get()) == CONNECTION_BAD, "a deleted principal cannot log in");
+    check(PQresultStatus(execute(reader.get(), "SELECT 1").get()) == PGRES_FATAL_ERROR,
+          "deleting a principal ends every connection it opened");
+}
+
 } // namespace
 
 int main() {
@@ -621,6 +797,8 @@ int main() {
 
     auto bad = connect(port, issued.access_grant->id, "wrong", "orders");
     check(PQstatus(bad.get()) == CONNECTION_BAD, "wrong grant secret must fail authentication");
+
+    test_principals(runtime, port, data, metadata, issued.access_grant->id, issued.database_credential);
 
     runtime.close_branch("training", "rollout-wire");
     auto revoked = execute(connection.get(), "SELECT state FROM orders");

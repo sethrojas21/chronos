@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chronos/gateway/access_grant_registry.hpp"
+#include "chronos/gateway/principal_registry.hpp"
 #include "chronosfs_fuse.hpp"
 #include "interval_data_plane.hpp"
 
@@ -100,7 +101,22 @@ class SqlBranchSession {
     }
     void set_schema_branching(bool enabled) { schema_branching_ = enabled; }
 
+    const std::string &workspace() const { return access_grant_.workspace; }
+    const std::string &branch() const { return access_grant_.branch; }
+    const std::string &store_alias() const { return store_alias_; }
+    // Set when a principal (stable login) opened the session; empty for an
+    // access grant. A principal session's access_grant() carries only its
+    // workspace, branch, and database: it has no grant id or credential.
+    const std::optional<std::string> &principal() const { return principal_; }
+    std::uint64_t credential_version() const { return credential_version_; }
+    // The branch chosen at login; RESET chronos.branch returns to it.
+    const std::string &startup_branch() const { return startup_branch_; }
+    // Writes are refused while true (a read-only branch of a principal).
+    bool read_only() const { return read_only_; }
+    void set_read_only(bool read_only) { read_only_ = read_only; }
+
   private:
+    friend class GatewayRuntime;
     // The session borrows driver state owned by the store, so destruction order
     // must keep the store alive until after the session is gone.
     std::unique_ptr<chronos::native::NativeBranchStore> store_;
@@ -108,6 +124,11 @@ class SqlBranchSession {
     AccessGrant access_grant_;
     bool schema_branching_ = true;
     std::vector<std::string> search_path_;
+    std::string store_alias_;
+    std::optional<std::string> principal_;
+    std::uint64_t credential_version_ = 0;
+    std::string startup_branch_;
+    bool read_only_ = false;
 };
 
 class GatewayRuntime {
@@ -135,10 +156,30 @@ class GatewayRuntime {
     AccessGrant close_branch(
         const std::string &workspace,
         const std::string &branch_id);
+    // Opens a SQL connection's branch session. `user` is an access grant id
+    // (grants are checked first) or a principal name; `database` is a store
+    // alias, or "workspace/alias" when a principal name is ambiguous.
+    // `requested_branch` (startup option chronos.branch) selects a principal's
+    // branch instead of its default; a grant accepts only its own branch.
     std::unique_ptr<SqlBranchSession> open_postgres(
-        const std::string &access_id,
+        const std::string &user,
         const std::string &credential,
-        const std::string &store_alias);
+        const std::string &database,
+        const std::optional<std::string> &requested_branch = std::nullopt);
+    // Re-checks an open session before each statement: the grant must still
+    // be active, or the principal must still exist with the same password and
+    // allow the branch. Refreshes the session's read-only flag.
+    void recheck_postgres(
+        SqlBranchSession &session,
+        const std::string &user,
+        const std::string &credential,
+        const std::string &database);
+    // A principal session on another allowed branch, keeping the session's
+    // search_path and login. Throws PermissionDenied for a grant session or a
+    // branch the principal may not use.
+    std::unique_ptr<SqlBranchSession> switch_postgres_branch(
+        const SqlBranchSession &current,
+        const std::string &branch);
 
     chronos::native::NativeChronosFilesystem &authorize_filesystem(
         const std::string &export_id,
@@ -153,6 +194,9 @@ class GatewayRuntime {
     std::vector<AccessGrant> expire_due();
     std::vector<AccessGrant> reclaim_due();
     AccessGrantRegistry &access_grants() { return access_grants_; }
+    PrincipalRegistry &principals() { return principals_; }
+    // The workspace's PostgreSQL store aliases (for principal database URLs).
+    std::vector<std::string> postgres_store_aliases(const std::string &workspace) const;
 
   private:
     struct Workspace {
@@ -167,8 +211,14 @@ class GatewayRuntime {
     void delete_branch(const AccessGrant &grant);
     void delete_branch(Workspace &target, const std::string &branch_id);
     ProvisionedBranch grant_access(const AccessGrantSpec &spec, bool reissue);
+    std::unique_ptr<SqlBranchSession> checkout_postgres(
+        const Workspace &target,
+        const std::string &store_alias,
+        const std::string &branch,
+        AccessGrant grant);
 
     AccessGrantRegistry access_grants_;
+    PrincipalRegistry principals_;
     mutable std::mutex workspaces_mutex_;
     std::unordered_map<std::string, std::shared_ptr<Workspace>> workspaces_;
 };
