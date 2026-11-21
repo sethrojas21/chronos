@@ -600,6 +600,31 @@ class _IntervalBackend(_SQLBranchBackend):
             return
         raise BranchingError("native interval branch store is unavailable")
 
+    def continue_branch_from(self, branch_id: str, onto: str) -> None:
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        try:
+            self._native_branch_store.continue_branch_from(branch_id, onto, self.child_width or 0)
+        except Exception as exc:
+            if "branch not found" in str(exc):
+                raise BranchNotFoundError(str(exc).rsplit("branch not found: ", 1)[-1]) from exc
+            raise
+        self._invalidate_native_branch_sessions()
+
+    def reset_branch(self, branch_id: str, checkpoint: str) -> None:
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        try:
+            self._native_branch_store.reset_branch(branch_id, checkpoint)
+        except Exception as exc:
+            message = str(exc)
+            if "branch not found: checkpoint:" in message:
+                raise BranchNotFoundError(f"checkpoint:{checkpoint}") from exc
+            if "branch not found" in message:
+                raise BranchNotFoundError(branch_id) from exc
+            raise
+        self._invalidate_native_branch_sessions()
+
     def update_branch_metadata(
         self, branch_id: str, metadata: dict[str, Any]
     ) -> BranchInfo:

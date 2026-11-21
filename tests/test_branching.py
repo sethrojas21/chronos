@@ -4851,3 +4851,63 @@ def test_postgres_long_table_names_get_distinct_physical_tables() -> None:
             assert session.query(f"SELECT v FROM hb_1795223737471.{name}") == [{"v": name}]
     finally:
         context.close()
+
+
+def test_interval_keep_branch_merge_lets_a_long_lived_branch_merge_again(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        price = lambda branch: _product(ctx.checkout(branch), "abc")["price"]  # noqa: E731
+        set_price = lambda branch, value: ctx.checkout(branch).execute(  # noqa: E731
+            "UPDATE products SET price = :price WHERE sku = :sku", {"sku": "abc", "price": value})
+        ctx.create_branch("agent", from_branch="main")
+        set_price("agent", 11)
+
+        # Without the option a merge behaves as before: the fork point stays
+        # the base, so syncing back conflicts.
+        ctx.create_branch("plain", from_branch="main")
+        set_price("plain", 11)
+        assert ctx.merge_apply(source="plain", target="main").applied == 1
+        assert ctx.merge_preview(source="main", target="plain").conflicts
+
+        ctx.create_branch("agent2", from_branch="main")
+        set_price("agent2", 12)
+        assert ctx.merge_apply(source="agent2", target="main", keep_branch=True).applied == 1
+        # The branch continues from the merged state: syncing back is a no-op ...
+        assert price("agent2") == 12
+        assert ctx.merge_apply(source="main", target="agent2").applied == 0
+        # ... and its next change merges without a conflict.
+        set_price("agent2", 13)
+        preview = ctx.merge_preview(source="agent2", target="main")
+        assert preview.conflicts == [] and len(preview.changes) == 1
+        assert ctx.merge_apply(source="agent2", target="main", keep_branch=True).applied == 1
+        assert price("main") == 13
+    finally:
+        ctx.close()
+
+
+def test_interval_reset_branch_moves_a_branch_back_to_a_checkpoint(sql_backend: str) -> None:
+    ctx = _make_products_only_context(sql_backend, "interval")
+    try:
+        ctx.create_branch("agent", from_branch="main", metadata={"agent": "a1"})
+        agent = ctx.checkout("agent")
+        agent.execute("UPDATE products SET price = :price WHERE sku = :sku", {"sku": "abc", "price": 11})
+        ctx.create_checkpoint("before", branch="agent")
+        agent.execute("UPDATE products SET price = :price WHERE sku = :sku", {"sku": "abc", "price": 99})
+
+        ctx.reset_branch("agent", "before")
+        assert _product(ctx.checkout("agent"), "abc")["price"] == 11
+        # Same branch, same metadata; no new branch; the checkpoint stays readable.
+        assert ctx.get_branch("agent").metadata == {"agent": "a1"}
+        assert sorted(branch.branch_id for branch in ctx.list_branches()) == ["agent", "main"]
+        assert _product(ctx.checkout_checkpoint("before"), "abc")["price"] == 11
+        # Work continues on the branch and merges as usual.
+        ctx.checkout("agent").execute("UPDATE products SET price = :price WHERE sku = :sku", {"sku": "abc", "price": 12})
+        assert ctx.merge_apply(source="agent", target="main").applied == 1
+        assert _product(ctx.checkout("main"), "abc")["price"] == 12
+
+        with pytest.raises(BranchNotFoundError):
+            ctx.reset_branch("agent", "missing")
+        with pytest.raises(BranchNotFoundError):
+            ctx.reset_branch("nobody", "before")
+    finally:
+        ctx.close()

@@ -1020,6 +1020,12 @@ class _SQLBranchBackend:
     def create_branch_from_checkpoint(self, branch_id: str, checkpoint: str) -> None:
         raise NotImplementedError
 
+    def continue_branch_from(self, branch_id: str, onto: str) -> None:
+        raise UnsupportedSQLError(f"{self.name} branches cannot continue from another branch")
+
+    def reset_branch(self, branch_id: str, checkpoint: str) -> None:
+        raise UnsupportedSQLError(f"{self.name} branches cannot be reset in place")
+
     def delete_branch(self, branch_id: str) -> None:
         raise NotImplementedError
 

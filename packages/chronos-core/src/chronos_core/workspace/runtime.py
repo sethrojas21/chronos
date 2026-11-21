@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +19,7 @@ from chronos_core.branching import (
     MergePreview,
     MergeResolution,
     RowDiff,
+    UnsupportedSQLError,
 )
 from chronos_core.branching._common import (
     MergePolicyInput,
@@ -515,6 +516,34 @@ class ChronosWorkspaceContext:
         return selected_ids, resolved, len(preview.change_ids) - len(selected_ids)
 
     def merge_atomic(
+        self,
+        source: str,
+        target: str,
+        *,
+        selection: MergeSelection | None = None,
+        preview_token: str | None = None,
+        resolution: MergeResolution | dict[str, MergeResolution] | None = None,
+        policy: MergePolicyInput = None,
+        operation_id: str,
+        keep_branch: bool = False,
+        _prepared_preview: AtomicMergePreview | None = None,
+        _allow_stable_selection_rebase: bool = False,
+    ) -> AtomicMergeResult:
+        """Merge source into target atomically across stores.
+
+        keep_branch=True then continues source from the merged target (see
+        continue_branch); without it the merge behaves exactly as before.
+        """
+        result = self._merge_atomic(
+            source, target, selection=selection, preview_token=preview_token, resolution=resolution,
+            policy=policy, operation_id=operation_id, _prepared_preview=_prepared_preview,
+            _allow_stable_selection_rebase=_allow_stable_selection_rebase,
+        )
+        if keep_branch:
+            self.continue_branch(source, target)
+        return result
+
+    def _merge_atomic(
         self,
         source: str,
         target: str,
@@ -1024,18 +1053,65 @@ class ChronosWorkspaceContext:
         resolution: MergeResolution | dict[str, MergeResolution] | None = None,
         *,
         policy: MergePolicyInput = None,
+        keep_branch: bool = False,
     ) -> dict[str, Any]:
+        """Merge source into target in every store.
+
+        keep_branch=True then continues source from the merged target (see
+        continue_branch); without it the merge behaves exactly as before.
+        """
         if self._atomic_control is not None:
             raise AtomicMergeError(
                 "merge_apply is unsafe for an atomic workspace; use merge_atomic"
             )
+        if keep_branch:
+            self._require_branch_moves("continue")
         with self._merge_lock(target, source=source):
-            return self._merge_apply_locked(
+            result = self._merge_apply_locked(
                 source,
                 target,
                 resolution,
                 policy=policy,
             )
+        if keep_branch:
+            self.continue_branch(source, target)
+        return result
+
+    def continue_branch(self, branch_id: str, onto: str) -> None:
+        """Continue branch_id from onto's current state in every store, keeping its name.
+
+        The branch then reads what onto holds, and its merge base with onto is
+        that state, so it can keep working and merge into onto again. Used by
+        the keep_branch option of the merges.
+        """
+        self._move_branch(lambda target: target.continue_branch(branch_id, onto), "continue")
+
+    def reset_branch(self, branch_id: str, checkpoint: str) -> None:
+        """Move branch_id back to a workspace checkpoint in place, keeping its name.
+
+        Unlike create_branch_from_checkpoint, no new branch is created.
+        """
+        self._move_branch(lambda target: target.reset_branch(branch_id, checkpoint), "reset")
+
+    def _require_branch_moves(self, action: str) -> None:
+        if self._atomic_control is not None:
+            return
+        unsupported = [name for name, store in self._store_map().items()
+                       if not callable(getattr(store, f"{action}_branch", None))]
+        if unsupported:
+            raise UnsupportedSQLError(
+                f"stores {', '.join(sorted(unsupported))} cannot {action} a branch in place")
+
+    def _move_branch(self, move: Callable[[Any], None], action: str) -> None:
+        if self._atomic_control is not None:
+            # One shared metadata plane: one branch head for every store.
+            move(self._atomic_control)
+            for store in self._store_map().values():
+                _refresh_workspace_store(store)
+            return
+        self._require_branch_moves(action)
+        for store in self._store_map().values():
+            move(store)
 
     @contextlib.contextmanager
     def _merge_lock(

@@ -874,6 +874,59 @@ class ChronosBranchContext:
         resolution: MergeResolution | None = None,
         *,
         policy: MergePolicyInput = None,
+        keep_branch: bool = False,
+    ) -> MergeResult:
+        """Merge source into target.
+
+        keep_branch=True then continues source from the merged target (see
+        continue_branch), so a long-lived source can keep working and merge
+        again. Without it the merge behaves exactly as before.
+        """
+        result = self._merge_apply(source, target, resolution, policy=policy)
+        if keep_branch:
+            self.continue_branch(source, target)
+        return result
+
+    def continue_branch(self, branch_id: str, onto: str) -> None:
+        """Continue branch_id from onto's current state, keeping its name and metadata.
+
+        The branch then reads exactly what onto holds and its merge base with
+        onto is that state: changes it makes next merge into onto without
+        replaying earlier ones, and merging onto back is a no-op. Any of its
+        changes not already in onto are no longer visible on it.
+        """
+        try:
+            with self._local_session_branch_operation([branch_id, onto]):
+                self._backend.continue_branch_from(branch_id, onto)
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._commit_autocommit()
+        self._metadata_epoch += 1
+
+    def reset_branch(self, branch_id: str, checkpoint: str) -> None:
+        """Move branch_id back to a checkpoint in place, keeping its name and metadata.
+
+        Unlike create_branch_from_checkpoint, no new branch is created. The
+        branch's later state is no longer visible on it; checkpoints taken
+        from it remain readable.
+        """
+        try:
+            with self._local_session_branch_operation([branch_id]):
+                self._backend.reset_branch(branch_id, checkpoint)
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._commit_autocommit()
+        self._metadata_epoch += 1
+
+    def _merge_apply(
+        self,
+        source: str,
+        target: str,
+        resolution: MergeResolution | None = None,
+        *,
+        policy: MergePolicyInput = None,
     ) -> MergeResult:
         normalized_policy = _normalize_merge_policy(policy)
         if self._backend.name == "orpheus" and (
