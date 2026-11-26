@@ -33,6 +33,7 @@ class _PersistentCLI:
 
     def __init__(self, config: Path, environment: dict[str, str]):
         self.signature = config.read_bytes()
+        self.last_error = ""
         self._stderr = TemporaryFile(mode="w+")
         self._process = subprocess.Popen(
             [sys.executable, "-X", "faulthandler", "-m", "chronos_core.cli", "--persistent"],
@@ -49,7 +50,9 @@ class _PersistentCLI:
         if not line:
             self._stderr.seek(0)
             raise AssertionError(f"persistent CLI gave no response to {arguments}: {self._stderr.read()}")
-        return json.loads(line)
+        response = json.loads(line)
+        self.last_error = response.get("error") or ""
+        return response
 
     def close(self) -> None:
         try:
@@ -522,6 +525,60 @@ class TestWorkspaceSQLWorkflows:
         assert result["stores"] == {"app": 1, "audit": 1}
         for store, table in tables.items():
             assert invoke("query", f"SELECT id FROM {table}", "--store", store) == [{"id": 1}]
+
+    @pytest.mark.parametrize("atomic", [False, True], ids=["coordinated", "atomic"])
+    def test_unique_is_enforced_within_each_branch(
+        self, cli_database: DatabaseConfig, tmp_path: Path, atomic: bool,
+    ) -> None:
+        """HeavenBase's case: a primary field declared UNIQUE must reject a second row."""
+        config = _workspace_config_file(tmp_path, cli_database, atomic=atomic)
+        invoke = partial(_invoke_workspace, config)
+
+        def error(*args: str) -> str:
+            invoke(*args, ok=False)
+            return _sessions[config.resolve()].last_error
+
+        invoke("table", "create", "CREATE TABLE skill (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
+               "name TEXT)", "--store", "app")
+        invoke("table", "register", "skill", "--primary-key", "id", "--store", "app")
+        # No database auto index is adopted: only Chronos's index for the constraint.
+        info = invoke("table", "info", "skill", "--store", "app")
+        assert [index["name"] for index in info["indexes"]] == ["skill_slug_key"]
+        insert = lambda branch, key, slug, ok=True: invoke(  # noqa: E731
+            "execute", "INSERT INTO skill (id, slug, name) VALUES (:id, :slug, :slug)", "--store", "app",
+            "--branch", branch, "--params", json.dumps({"id": key, "slug": slug}), ok=ok)
+        insert("main", "1", "web-search")
+        message = error("execute", "INSERT INTO skill (id, slug, name) VALUES ('2', 'web-search', 'x')",
+                        "--store", "app")
+        assert 'unique constraint "skill_slug_key"' in message and "Key (slug)=(web-search)" in message
+        error("upsert", "skill", '[{"id": "3", "slug": "web-search", "name": "x"}]', "--store", "app")
+        assert invoke("query", "SELECT id FROM skill", "--store", "app") == [{"id": "1"}]
+
+        # The same slug on two branches is fine; merging one into the other is a conflict.
+        invoke("branch", "create", "agent")
+        insert("agent", "4", "pdf")
+        insert("main", "5", "pdf")
+        insert("agent", "6", "notes")
+        if atomic:
+            preview = invoke("merge", "atomic-preview", "agent", "main")
+            store = preview["stores"]["app"]
+            assert [c["key"] for c in store["conflicts"]] == [{"id": "4"}]
+            assert [c["key"] for c in store["changes"]] == [{"id": "6"}]
+            invoke("merge", "atomic-apply", "agent", "main", "--operation-id", "dup",
+                   "--preview-token", preview["preview_token"], ok=False)
+        else:
+            preview = invoke("merge", "preview", "agent", "main")["app"]
+            assert [c["key"] for c in preview["conflicts"]] == [{"id": "4"}]
+            assert [c["key"] for c in preview["changes"]] == [{"id": "6"}]
+            assert "unresolved conflicts" in error("merge", "apply", "agent", "main")
+        assert invoke("query", "SELECT id FROM skill ORDER BY id", "--store", "app") == [{"id": "1"}, {"id": "5"}]
+
+        # --unique declares a constraint when registering a table created without one.
+        invoke("table", "create", "CREATE TABLE tag (id TEXT PRIMARY KEY, org TEXT, name TEXT)", "--store", "app")
+        invoke("table", "register", "tag", "--primary-key", "id", "--unique", "org,name", "--store", "app")
+        invoke("execute", "INSERT INTO tag (id, org, name) VALUES ('1', 'a', 'x'), ('2', 'b', 'x')",
+               "--store", "app")
+        error("execute", "INSERT INTO tag (id, org, name) VALUES ('3', 'a', 'x')", "--store", "app")
 
     def test_nonfinite_api_result_is_not_printed_as_invalid_json(self, tmp_path: Path) -> None:
         config = _workspace_config_file(tmp_path, DatabaseConfig(f"sqlite:///{tmp_path / 'app.sqlite'}"))

@@ -218,12 +218,20 @@ def _merge_atomic(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
 def _register_table(c: WorkspaceConfig, a: dict[str, Any]) -> Call:
     store, table, primary_key = _store(c, a), _text(a, "table"), _names(a, "primary_key")
     create_sql = _text(a, "create_sql", required=False)
+    unique = a.get("unique")
+    if unique is not None and (
+        not isinstance(unique, list)
+        or not all(isinstance(columns, list) and columns and all(isinstance(column, str) and column
+                                                                  for column in columns)
+                   for columns in unique)):
+        raise ControlError(400, "unique must be an array of non-empty arrays of column names")
 
     def run(ws: Any) -> Any:
-        # Optional CREATE TABLE first, as `chronos table create` then `table register`.
+        # Optional CREATE TABLE first, as `chronos table create` then `table register`;
+        # its UNIQUE columns are declared, like the unique argument.
         if create_sql is not None:
             operations.create_table(ws, store, create_sql)
-        return operations.register_table(ws, store, table, primary_key)
+        return operations.register_table(ws, store, table, primary_key, unique)
     return run
 
 
@@ -263,7 +271,8 @@ _OPERATIONS: dict[str, tuple[Callable[[Any, dict[str, Any]], Call], frozenset[st
     "merge_atomic": (
         _merge_atomic, frozenset({"source", "target", "policy", "operation_id", "preview_token", "keep_branch"}),
         200, True),
-    "register_table": (_register_table, frozenset({"store", "table", "primary_key", "create_sql"}), 201, False),
+    "register_table": (
+        _register_table, frozenset({"store", "table", "primary_key", "create_sql", "unique"}), 201, False),
     "table_info": (_table_info, frozenset({"store", "table"}), 200, False),
     "create_index": (_create_index, frozenset({"store", "table", "columns", "name"}), 201, False),
     # CREATE TABLE / CREATE INDEX from SQL clients of a shared-structure workspace.

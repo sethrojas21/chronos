@@ -62,8 +62,21 @@ class ChronosPostgresStore:
     def metadata_db(self) -> Any:
         return self.context.metadata_db
 
-    def register_table(self, table: str, primary_key: list[str]) -> None:
-        self.context.register_table(table, primary_key)
+    def register_table(
+        self,
+        table: str,
+        primary_key: list[str],
+        unique: list[list[str]] | None = None,
+    ) -> None:
+        self.context.register_table(table, primary_key, unique=unique)
+
+    def declare_unique(
+        self, table: str, columns: list[str], name: str | None = None
+    ) -> Any:
+        return self.context.declare_unique(table, columns, name)
+
+    def list_unique_constraints(self, table: str | None = None) -> Any:
+        return self.context.list_unique_constraints(table)
 
     def checkout(self, branch_id: str = "main") -> BranchSession:
         return self.context.checkout(branch_id)
@@ -154,8 +167,21 @@ class ChronosDuckDBStore:
     def metadata_db(self) -> Any:
         return self.context.metadata_db
 
-    def register_table(self, table: str, primary_key: list[str]) -> None:
-        self.context.register_table(table, primary_key)
+    def register_table(
+        self,
+        table: str,
+        primary_key: list[str],
+        unique: list[list[str]] | None = None,
+    ) -> None:
+        self.context.register_table(table, primary_key, unique=unique)
+
+    def declare_unique(
+        self, table: str, columns: list[str], name: str | None = None
+    ) -> Any:
+        return self.context.declare_unique(table, columns, name)
+
+    def list_unique_constraints(self, table: str | None = None) -> Any:
+        return self.context.list_unique_constraints(table)
 
     def checkout(self, branch_id: str = "main") -> BranchSession:
         return self.context.checkout(branch_id)

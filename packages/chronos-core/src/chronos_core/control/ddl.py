@@ -11,9 +11,13 @@ These calls are not part of the client's transaction: the table or index
 exists on every branch as soon as the statement returns, and a rollback does
 not remove it.
 
-UNIQUE in CREATE TABLE is accepted as a lookup index on the same columns but
-is NOT enforced: a branch can hold duplicate values, and merges do not check
-them. Enforcing it per branch would be an engine feature.
+UNIQUE in CREATE TABLE is enforced within each branch: it is removed from the
+physical table (whose automatic index would not see branch versions) and
+declared to Chronos, which refuses a write or merge that would leave two rows
+with the same non-NULL values on one branch (SQLSTATE 23505 through the
+gateway). The same value on two branches is fine. Each constraint gets a
+Chronos index named as PostgreSQL names the constraint (table_col_key), per
+schema. `chronos table create` parses UNIQUE the same way (split_unique).
 """
 from __future__ import annotations
 
@@ -40,8 +44,8 @@ class CreateTable:
     primary_key: tuple[str, ...]
     if_not_exists: bool
     sql: str
-    # Column sets declared UNIQUE. They become plain Chronos indexes; the
-    # constraint is not enforced on versioned rows (see apply_shared_ddl).
+    # Column sets declared UNIQUE, other than the primary key. Each is
+    # declared to Chronos and enforced within each branch.
     unique_columns: tuple[tuple[str, ...], ...] = ()
 
 
@@ -91,32 +95,11 @@ def parse_shared_ddl(sql: str, search_path: list[str] | None = None) -> CreateTa
         if current is not None and not schema.this.args.get("db"):
             schema.this.set("db", exp.to_identifier(current, quoted=True))
             sql = statement.sql(dialect="postgres")
-        # UNIQUE is removed from the table PostgreSQL creates: its automatic
-        # index would be adopted at registration under a name that is not
-        # per schema, and it would not constrain the versioned rows anyway.
-        unique_columns: list[tuple[str, ...]] = []
-        for item in list(schema.expressions):
-            if isinstance(item, exp.ColumnDef):
-                for constraint in list(item.constraints):
-                    if isinstance(constraint.kind, exp.UniqueColumnConstraint):
-                        unique_columns.append((item.name,))
-                        constraint.pop()
-            elif isinstance(item, exp.UniqueColumnConstraint):
-                columns = item.this.expressions if isinstance(item.this, exp.Schema) else []
-                if columns:
-                    unique_columns.append(tuple(column.name for column in columns))
-                item.pop()
+        unique_columns = _strip_unique(schema)
         if unique_columns:
             sql = statement.sql(dialect="postgres")
         table = _table_name(schema.this)
-        primary_key: list[str] = []
-        for item in schema.expressions:
-            if isinstance(item, exp.ColumnDef) and any(
-                isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint) for constraint in item.constraints
-            ):
-                primary_key.append(item.name)
-            elif isinstance(item, exp.PrimaryKey):
-                primary_key.extend(column.name for column in item.expressions)
+        primary_key = _primary_key(schema)
         if not primary_key:
             raise SharedDDLError(f"table {table!r} needs a primary key to be versioned by Chronos")
         unique = tuple(columns for columns in dict.fromkeys(unique_columns) if columns != tuple(primary_key))
@@ -170,14 +153,10 @@ def apply_shared_ddl(workspace: ChronosWorkspaceContext, store: str, sql: str,
             raise SharedDDLError(f'relation "{statement.table}" already exists', "42P07")
         if not info.exists:
             operations.create_table(workspace, store, statement.sql)
-        operations.register_table(workspace, store, statement.table, list(statement.primary_key))
-        for columns in statement.unique_columns:
-            # A lookup index, named as PostgreSQL names the constraint's
-            # index and scoped to the schema. UNIQUE is not enforced.
-            schema, _, bare = statement.table.rpartition(".")
-            name = f"{bare}_{'_'.join(columns)}_key"
-            operations.create_index(workspace, store, statement.table, list(columns),
-                                    f"{schema}.{name}" if schema else name)
+        # Each UNIQUE set is declared and indexed (named table_col_key, per
+        # schema) as part of registration, before any row can be written.
+        operations.register_table(workspace, store, statement.table, list(statement.primary_key),
+                                  [list(columns) for columns in statement.unique_columns])
         return {"tag": "CREATE TABLE", "created": True}
     if not info.registered:
         raise SharedDDLError(f'relation "{statement.table}" does not exist', "42P01")
@@ -196,6 +175,83 @@ _SHARED_ONLY = (
     "table structure is shared by every branch in this workspace; only CREATE TABLE "
     "(with a primary key) and CREATE INDEX are accepted, and they apply to every branch"
 )
+
+
+def _strip_unique(schema: Any) -> list[tuple[str, ...]]:
+    """Remove UNIQUE from a CREATE TABLE's columns and constraints; return the sets.
+
+    The physical table must not enforce UNIQUE itself: it holds every branch's
+    row versions, and its automatic index would be adopted at registration
+    under a name that is not per schema.
+    """
+    from sqlglot import exp
+
+    unique_columns: list[tuple[str, ...]] = []
+    for item in list(schema.expressions):
+        if isinstance(item, exp.ColumnDef):
+            for constraint in list(item.constraints):
+                if isinstance(constraint.kind, exp.UniqueColumnConstraint):
+                    unique_columns.append((item.name,))
+                    constraint.pop()
+        elif isinstance(item, exp.UniqueColumnConstraint):
+            columns = item.this.expressions if isinstance(item.this, exp.Schema) else []
+            if columns:
+                unique_columns.append(tuple(column.name for column in columns))
+            item.pop()
+    return unique_columns
+
+
+def _primary_key(schema: Any) -> list[str]:
+    from sqlglot import exp
+
+    primary_key: list[str] = []
+    for item in schema.expressions:
+        if isinstance(item, exp.ColumnDef) and any(
+            isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint) for constraint in item.constraints
+        ):
+            primary_key.append(item.name)
+        elif isinstance(item, exp.PrimaryKey):
+            primary_key.extend(column.name for column in item.expressions)
+    return primary_key
+
+
+@dataclass(frozen=True)
+class SplitUnique:
+    """A CREATE TABLE with UNIQUE removed, and what was removed."""
+
+    sql: str
+    table: str
+    unique_columns: tuple[tuple[str, ...], ...]
+
+
+def split_unique(sql: str, dialect: str) -> SplitUnique:
+    """Remove UNIQUE from one CREATE TABLE written in dialect ("sqlite" or "postgres").
+
+    Returns the statement unchanged when it declares no UNIQUE (or is not a
+    plain CREATE TABLE), so tables without UNIQUE are created exactly as
+    written. Sets equal to the primary key are dropped: it is unique already.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statements = [item for item in sqlglot.parse(sql, read=dialect) if item is not None]
+    except sqlglot.errors.ParseError:
+        return SplitUnique(sql, "", ())
+    if len(statements) != 1 or not isinstance(statements[0], exp.Create):
+        return SplitUnique(sql, "", ())
+    statement = statements[0]
+    schema = statement.this
+    if str(statement.args.get("kind") or "").upper() != "TABLE" or not isinstance(schema, exp.Schema) \
+            or not isinstance(schema.this, exp.Table):
+        return SplitUnique(sql, "", ())
+    table = _table_name(schema.this)
+    unique_columns = _strip_unique(schema)
+    if not unique_columns:
+        return SplitUnique(sql, table, ())
+    primary_key = tuple(_primary_key(schema))
+    unique = tuple(columns for columns in dict.fromkeys(unique_columns) if columns != primary_key)
+    return SplitUnique(statement.sql(dialect=dialect), table, unique)
 
 
 def _table_name(table: Any) -> str:

@@ -72,18 +72,32 @@ def create_table(
     store: str = typer.Option(..., "--store"),
     file: Path | None = typer.Option(None, "--file"), stdin: bool = typer.Option(False, "--stdin"),
 ) -> None:
+    """Create a table. UNIQUE columns are enforced within each branch once it is registered."""
     statement = _create_table_input(sql, file, stdin)
     with connect_workspace(ctx, store) as workspace:
-        database = workspace.stores[store]
-        database.db.execute(statement)
-        print_result(database.db.commit())
+        print_result(operations.create_table(workspace, store, statement))
+
+
+def _unique_sets(values: list[str] | None) -> list[list[str]]:
+    sets = []
+    for value in values or []:
+        columns = [column.strip() for column in value.split(",")]
+        if not all(columns):
+            raise typer.BadParameter("Expected column names separated by commas.", param_hint="--unique")
+        sets.append(columns)
+    return sets
 
 
 @table_app.command("register")
 def register_table(ctx: typer.Context, table: str, store: str = typer.Option(..., "--store"),
-                   primary_key: list[str] = typer.Option(..., "--primary-key")) -> None:
+                   primary_key: list[str] = typer.Option(..., "--primary-key"),
+                   unique: list[str] | None = typer.Option(
+                       None, "--unique",
+                       help="Columns kept unique within each branch, comma-separated; repeatable.")) -> None:
+    """Register a table for branching, with UNIQUE from `table create` or --unique."""
+    unique_sets = _unique_sets(unique)
     with connect_workspace(ctx, store) as workspace:
-        print_result(operations.register_table(workspace, store, table, primary_key))
+        print_result(operations.register_table(workspace, store, table, primary_key, unique_sets))
 
 
 @table_app.command("index")

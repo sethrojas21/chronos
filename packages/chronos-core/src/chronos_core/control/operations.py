@@ -83,13 +83,29 @@ def merge_atomic(workspace: ChronosWorkspaceContext, source: str, target: str, *
 
 
 def create_table(workspace: ChronosWorkspaceContext, store: str, sql: str) -> Any:
-    """Run one ordinary CREATE TABLE on the store, as `chronos table create` does."""
+    """Run one ordinary CREATE TABLE on the store, as `chronos table create` does.
+
+    UNIQUE is taken out of the physical table and declared to Chronos, which
+    enforces it within each branch once the table is registered. A statement
+    without UNIQUE runs exactly as written.
+    """
+    from chronos_core.control.ddl import split_unique
+
     database = workspace.stores[store]
-    database.db.execute(sql)
-    return database.db.commit()
+    dialect = getattr(database.db, "dialect", "sqlite")
+    split = split_unique(sql, "postgres" if dialect == "postgres" else "sqlite")
+    database.db.execute(split.sql)
+    result = database.db.commit()
+    for columns in split.unique_columns:
+        database.declare_unique(split.table, list(columns))
+    return result
 
 
-def register_table(workspace: ChronosWorkspaceContext, store: str, table: str, primary_key: list[str]) -> Any:
+def register_table(workspace: ChronosWorkspaceContext, store: str, table: str, primary_key: list[str],
+                   unique: list[list[str]] | None = None) -> Any:
+    """Register a table; unique lists column sets kept unique within each branch."""
+    if unique:
+        return workspace.stores[store].register_table(table, primary_key, unique=unique)
     return workspace.stores[store].register_table(table, primary_key)
 
 

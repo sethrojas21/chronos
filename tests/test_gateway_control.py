@@ -11,6 +11,7 @@ import pytest
 
 from chronos_core.control import gateway as gateway_module
 from chronos_core.control.gateway import GatewayControl
+from chronos_core.branching import UniqueViolationError
 
 
 def _control(tmp_path: Path, **store: Any) -> GatewayControl:
@@ -94,6 +95,30 @@ def test_tables_and_indexes(control: GatewayControl) -> None:
     # describe_table refuses under branch-local schema, as in the CLI with schema branching.
     status, body = _call(control, "table_info", store="app", table="orders")
     assert status == 400 and "branch-local schemas" in body["error"]
+
+
+def test_register_table_declares_unique(control: GatewayControl) -> None:
+    status, _ = _call(control, "register_table", store="app", table="skill", primary_key=["id"],
+                      create_sql="CREATE TABLE skill (id TEXT PRIMARY KEY, slug TEXT UNIQUE, org TEXT, name TEXT)",
+                      unique=[["org", "name"]])
+    assert status == 201
+    app = control._open(control._workspaces["local"]).stores["app"]
+    assert sorted(c.columns for c in app.list_unique_constraints("skill")) == [("org", "name"), ("slug",)]
+    main = app.checkout("main")
+    main.execute("INSERT INTO skill (id, slug, org, name) VALUES ('1', 'web-search', 'a', 'x')")
+    for duplicate in ("('2', 'web-search', 'b', 'y')", "('3', 'other', 'a', 'x')"):
+        with pytest.raises(UniqueViolationError):
+            main.execute(f"INSERT INTO skill (id, slug, org, name) VALUES {duplicate}")
+    assert _call(control, "register_table", store="app", table="skill", primary_key=["id"],
+                 unique=["slug"])[0] == 400
+
+    # Declaring UNIQUE over rows that already repeat is refused with 23505.
+    _call(control, "register_table", store="app", table="orders", primary_key=["id"])
+    orders = app.checkout("main")
+    orders.execute("INSERT INTO orders (id, state) VALUES (1, 'new'), (2, 'new')")
+    status, body = _call(control, "register_table", store="app", table="orders", primary_key=["id"],
+                         unique=[["state"]])
+    assert status == 400 and body["sqlstate"] == "23505" and "duplicated on branch main" in body["error"], body
 
 
 def test_request_errors(control: GatewayControl) -> None:
@@ -375,8 +400,8 @@ def test_keep_branch_atomic_merge_lets_a_long_lived_branch_merge_again(tmp_path:
         control.close()
 
 
-def test_shared_structure_unique_becomes_a_per_schema_index(postgres_url: str) -> None:
-    """UNIQUE is accepted as a lookup index, named per schema, and not enforced."""
+def test_shared_structure_unique_is_enforced_per_branch_with_a_per_schema_index(postgres_url: str) -> None:
+    """UNIQUE is declared to Chronos, indexed under a per-schema name, and enforced per branch."""
     workspace = {"schema_branching": False, "stores": {"app": {"data_url": postgres_url}}}
     control = GatewayControl(json.dumps({"workspaces": {"shared": workspace}}))
     try:
@@ -393,9 +418,25 @@ def test_shared_structure_unique_becomes_a_per_schema_index(postgres_url: str) -
         _, info = _call(control, "table_info", workspace="shared", store="app", table="pairs")
         assert [(i["name"], i["columns"]) for i in info["indexes"]] == [("pairs_a_b_key", ["a", "b"])]
 
-        # Documented: not enforced on the versioned rows.
-        session = control._open(control._workspaces["shared"]).stores["app"].checkout("main")
-        session.upsert_rows("ws_a.agent-skill", [{"objectId": "1", "slug": "same"}, {"objectId": "2", "slug": "same"}])
-        assert len(session.query('SELECT "objectId" FROM ws_a."agent-skill"')) == 2
+        workspace_context = control._open(control._workspaces["shared"])
+        app = workspace_context.stores["app"]
+        assert [(c.table, c.name, c.columns) for c in app.list_unique_constraints()] == [
+            ("pairs", "pairs_a_b_key", ("a", "b")),
+            ("ws_a.agent-skill", "agent-skill_slug_key", ("slug",)),
+            ("ws_b.agent-skill", "agent-skill_slug_key", ("slug",)),
+        ]
+        session = app.checkout("main")
+        with pytest.raises(UniqueViolationError) as raised:
+            session.upsert_rows("ws_a.agent-skill", [{"objectId": "1", "slug": "same"}, {"objectId": "2", "slug": "same"}])
+        assert raised.value.sqlstate == "23505"
+        assert session.query('SELECT "objectId" FROM ws_a."agent-skill"') == []
+        # Each schema's table is its own; another branch may hold the same slug.
+        session.upsert_rows("ws_a.agent-skill", [{"objectId": "1", "slug": "same"}])
+        session.upsert_rows("ws_b.agent-skill", [{"objectId": "1", "slug": "same"}])
+        workspace_context.create_branch("agent")
+        app.checkout("agent").upsert_rows("ws_a.agent-skill", [{"objectId": "1", "slug": "other"}])
+        app.checkout("agent").upsert_rows("ws_a.agent-skill", [{"objectId": "2", "slug": "same"}])
+        with pytest.raises(UniqueViolationError):
+            session.upsert_rows("ws_a.agent-skill", [{"objectId": "3", "slug": "same"}])
     finally:
         control.close()
