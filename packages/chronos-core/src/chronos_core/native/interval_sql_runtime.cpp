@@ -3718,6 +3718,13 @@ struct NativeBranchSegment {
     std::string branch_kind;
 };
 
+// A UNIQUE constraint declared on a logical table: no two rows visible on one
+// branch may hold the same non-NULL values in these columns.
+struct NativeUniqueConstraint {
+    std::string name;
+    std::vector<std::string> columns;
+};
+
 struct NativeTableMeta {
     std::string logical_name;
     std::string physical_name;
@@ -3727,6 +3734,8 @@ struct NativeTableMeta {
     std::string schema_version_id;
     std::string ddl_op;
     bool has_schema_binding = false;
+    // From _chronos_branch_unique_constraints; empty for tables without UNIQUE.
+    std::vector<NativeUniqueConstraint> unique_constraints = {};
 };
 
 // The PostgreSQL type OID of a stored column definition such as

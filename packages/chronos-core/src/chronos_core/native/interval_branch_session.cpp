@@ -120,6 +120,17 @@ class NativeBranchSessionImpl {
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
+            if (!deleted) {
+                // Deletes never break UNIQUE; live rows replace their own keys.
+                const NativeTableMeta meta = table_meta_for(logical_table);
+                if (!meta.unique_constraints.empty()) {
+                    store_.lock_unique_writes(meta, branch_id_);
+                    store_.require_unique_rows(
+                        meta, columns, pk_columns, rows, rows, segment_.branch_point,
+                        "on branch " + branch_id_
+                    );
+                }
+            }
             const bool private_exact_key_upsert_allowed =
                 store_.dialect() == "sqlite" && branch_private_dml_allowed_for_transaction();
             store_.driver().interval_upsert(
@@ -159,11 +170,38 @@ class NativeBranchSessionImpl {
         const bool started_data_tx = !store_.driver().in_transaction();
         if (started_data_tx) store_.driver().execute(store_.dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
         try {
+            // INSERT never replaces a row, so every visible row is compared.
+            // ON CONFLICT DO NOTHING skips a row that would break UNIQUE, as
+            // PostgreSQL does; plain INSERT refuses the statement.
+            const NativeTableMeta meta = table_meta_for(logical_table);
+            NativeRows kept_rows;
+            const NativeRows *written = &rows;
+            if (!meta.unique_constraints.empty()) {
+                store_.lock_unique_writes(meta, branch_id_);
+                auto clashes = store_.find_unique_clashes(
+                    meta, columns, pk_columns, rows, {}, segment_.branch_point,
+                    "on branch " + branch_id_, !ignore_conflicts
+                );
+                if (!clashes.empty()) {
+                    if (!ignore_conflicts) throw std::runtime_error(clashes.front().message);
+                    std::unordered_set<std::size_t> skipped;
+                    for (const auto &clash : clashes) skipped.insert(clash.row_index);
+                    for (std::size_t i = 0; i < rows.size(); ++i) {
+                        if (!skipped.count(i)) kept_rows.push_back(rows[i]);
+                    }
+                    written = &kept_rows;
+                    if (kept_rows.empty()) {
+                        commit_if_started(started_data_tx);
+                        commit_statement_write_guard(statement_guard, metadata_guard);
+                        return 0;
+                    }
+                }
+            }
             BulkUpsertResult result = store_.driver().interval_upsert(
-                physical_table_for(logical_table),
+                meta.physical_name,
                 columns,
                 pk_columns,
-                rows,
+                *written,
                 segment_.live_lo,
                 segment_.live_hi,
                 segment_.segment_id,
@@ -2524,19 +2562,36 @@ class NativeBranchSessionImpl {
         return out;
     }
 
+    // True when an UPDATE assigns a column of a UNIQUE constraint. Such
+    // updates take the general path, whose upsert_rows checks the constraint;
+    // the in-place fast paths below write physical rows directly.
+    static bool assigns_unique_column(const NativeUpdatePlan &plan, const NativeTableMeta &meta) {
+        for (const auto &constraint : meta.unique_constraints) {
+            for (const auto &[column, _] : plan.assignments) {
+                if (std::find(constraint.columns.begin(), constraint.columns.end(), column) !=
+                    constraint.columns.end()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     std::int64_t execute_update(const NativeUpdatePlan &plan, const std::vector<Value> &params) {
         NativeTableMeta meta = table_meta_for(plan.table);
-        if (auto private_count = try_update_private_schema_table_in_place(plan, meta, params)) {
-            return *private_count;
-        }
-        if (auto direct_private_count = try_postgres_private_point_update(plan, meta, params)) {
-            return *direct_private_count;
-        }
-        if (auto prefix_private_count = try_postgres_private_prefix_update(plan, meta, params)) {
-            return *prefix_private_count;
-        }
-        if (auto point_count = try_postgres_point_update_cte(plan, meta, params)) {
-            return *point_count;
+        if (!assigns_unique_column(plan, meta)) {
+            if (auto private_count = try_update_private_schema_table_in_place(plan, meta, params)) {
+                return *private_count;
+            }
+            if (auto direct_private_count = try_postgres_private_point_update(plan, meta, params)) {
+                return *direct_private_count;
+            }
+            if (auto prefix_private_count = try_postgres_private_prefix_update(plan, meta, params)) {
+                return *prefix_private_count;
+            }
+            if (auto point_count = try_postgres_point_update_cte(plan, meta, params)) {
+                return *point_count;
+            }
         }
         QueryResult current = select_candidate_rows_for_dml(
             meta,

@@ -25,6 +25,8 @@ from chronos_core.branching.api import (
     TableColumn,
     TableInfo,
     TableNotRegisteredError,
+    UniqueConstraintInfo,
+    UniqueViolationError,
     UnsupportedSQLError,
     IntervalDataPlane,
     IntervalMetadataPlane,
@@ -57,5 +59,7 @@ __all__ = [
     "TableColumn",
     "TableInfo",
     "TableNotRegisteredError",
+    "UniqueConstraintInfo",
+    "UniqueViolationError",
     "UnsupportedSQLError",
 ]

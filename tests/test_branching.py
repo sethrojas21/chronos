@@ -21,6 +21,8 @@ from chronos_core.branching import (
     MergeValidationResult,
     TableNotRegisteredError,
     ChronosBranchContext,
+    UniqueConstraintInfo,
+    UniqueViolationError,
 )
 from chronos_core.branching.sql_adapters import connect_sql_database
 from chronos_core.branching.sql_adapters import PostgresDatabaseAdapter
@@ -4957,4 +4959,340 @@ def test_interval_branch_queries_terminate_on_a_parent_loop(sql_backend: str) ->
         ctx.delete_branch("looped")
         assert "looped" not in _parents(ctx)
     finally:
+        ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# UNIQUE constraints, enforced within each branch (interval backend).
+# ---------------------------------------------------------------------------
+
+
+def _make_skills_context(
+    sql_backend: str, unique: list[list[str]] | None = None
+) -> ChronosBranchContext:
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+    context = ChronosBranchContext.connect(_database_url(sql_backend), backend="interval")
+    context._test_sql_backend = sql_backend  # type: ignore[attr-defined]
+    context.db.execute(
+        "CREATE TABLE skills (id TEXT PRIMARY KEY, slug TEXT, org TEXT, name TEXT)"
+    )
+    context.db.commit()
+    context.register_table("skills", ["id"], unique=unique)
+    return context
+
+
+def _skill_ids(session) -> list[str]:
+    return [row["id"] for row in session.query("SELECT id FROM skills ORDER BY id")]
+
+
+def _insert_skill(session, skill_id: str, slug: str | None, org: str | None = "acme") -> None:
+    session.execute(
+        "INSERT INTO skills (id, slug, org, name) VALUES (:id, :slug, :org, :id)",
+        {"id": skill_id, "slug": slug, "org": org},
+    )
+
+
+def test_unique_refuses_a_second_row_with_the_same_value_on_a_branch(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    try:
+        main = ctx.checkout("main")
+        _insert_skill(main, "s1", "web-search")
+        with pytest.raises(UniqueViolationError) as raised:
+            _insert_skill(main, "s2", "web-search")
+        assert isinstance(raised.value, BranchingError)
+        message = str(raised.value)
+        assert 'unique constraint "skills_slug_key"' in message
+        assert "Key (slug)=(web-search)" in message
+        assert "chronos_unique_violation" not in message
+        assert _skill_ids(main) == ["s1"]
+        # Two VALUES rows with one slug are refused together.
+        with pytest.raises(UniqueViolationError):
+            main.execute(
+                "INSERT INTO skills (id, slug) VALUES ('s3', 'dup'), ('s4', 'dup')"
+            )
+        assert _skill_ids(main) == ["s1"]
+        # ON CONFLICT DO NOTHING skips the row instead, as PostgreSQL does.
+        result = main.execute(
+            "INSERT INTO skills (id, slug) VALUES ('s5', 'web-search'), ('s6', 'other') "
+            "ON CONFLICT DO NOTHING"
+        )
+        assert result.rowcount == 1
+        assert _skill_ids(main) == ["s1", "s6"]
+        assert [c.columns for c in ctx.list_unique_constraints("skills")] == [("slug",)]
+        assert ("slug",) in {index.columns for index in ctx.list_indexes("skills")}
+    finally:
+        ctx.close()
+
+
+def test_unique_refuses_updates_and_upserts_that_duplicate(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    try:
+        main = ctx.checkout("main")
+        _insert_skill(main, "s1", "a")
+        _insert_skill(main, "s2", "b")
+        with pytest.raises(UniqueViolationError):
+            main.execute("UPDATE skills SET slug = 'a' WHERE id = 's2'")
+        # Other columns, and a row keeping its own value, are fine.
+        main.execute("UPDATE skills SET name = 'renamed' WHERE id = 's1'")
+        main.execute("UPDATE skills SET slug = 'a', name = 'again' WHERE id = 's1'")
+        assert main.query("SELECT slug FROM skills WHERE id = 's2'") == [{"slug": "b"}]
+
+        with pytest.raises(UniqueViolationError):
+            main.upsert_rows("skills", [{"id": "s3", "slug": "b", "org": None, "name": None}])
+        with pytest.raises(UniqueViolationError):
+            main.upsert_rows(
+                "skills",
+                [
+                    {"id": "s4", "slug": "c", "org": None, "name": None},
+                    {"id": "s5", "slug": "c", "org": None, "name": None},
+                ],
+            )
+        assert _skill_ids(main) == ["s1", "s2"]
+        # A batch may move a value from one row to another.
+        main.upsert_rows(
+            "skills",
+            [
+                {"id": "s2", "slug": "z", "org": None, "name": None},
+                {"id": "s4", "slug": "b", "org": None, "name": None},
+            ],
+        )
+        assert main.query("SELECT id FROM skills WHERE slug = 'b'") == [{"id": "s4"}]
+        # A deleted row frees its value.
+        main.execute("DELETE FROM skills WHERE id = 's1'")
+        _insert_skill(main, "s6", "a")
+        assert main.query("SELECT id FROM skills WHERE slug = 'a'") == [{"id": "s6"}]
+    finally:
+        ctx.close()
+
+
+def test_unique_ignores_nulls_and_sees_earlier_rows_of_the_transaction(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    try:
+        main = ctx.checkout("main")
+        _insert_skill(main, "n1", None)
+        _insert_skill(main, "n2", None)
+        with pytest.raises(UniqueViolationError):
+            with main.transaction():
+                _insert_skill(main, "t1", "same-tx")
+                _insert_skill(main, "t2", "same-tx")
+        assert _skill_ids(main) == ["n1", "n2"]
+        with main.transaction():
+            _insert_skill(main, "t1", "same-tx")
+            _insert_skill(main, "t2", "other-tx")
+        assert _skill_ids(main) == ["n1", "n2", "t1", "t2"]
+    finally:
+        ctx.close()
+
+
+def test_unique_allows_the_same_value_on_different_branches(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    try:
+        ctx.create_branch("left", from_branch="main")
+        ctx.create_branch("right", from_branch="main")
+        _insert_skill(ctx.checkout("left"), "l1", "web-search")
+        _insert_skill(ctx.checkout("right"), "r1", "web-search")
+        _insert_skill(ctx.checkout("main"), "m1", "web-search")
+        assert _skill_ids(ctx.checkout("left")) == ["l1"]
+        assert _skill_ids(ctx.checkout("right")) == ["r1"]
+        with pytest.raises(UniqueViolationError):
+            _insert_skill(ctx.checkout("left"), "l2", "web-search")
+        # A branch made later inherits the parent's row and its constraint.
+        ctx.create_branch("child", from_branch="main")
+        with pytest.raises(UniqueViolationError):
+            _insert_skill(ctx.checkout("child"), "c1", "web-search")
+    finally:
+        ctx.close()
+
+
+def test_unique_over_several_columns(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["org", "slug"]])
+    try:
+        main = ctx.checkout("main")
+        _insert_skill(main, "s1", "a", "acme")
+        _insert_skill(main, "s2", "a", "other")
+        _insert_skill(main, "s3", "a", None)
+        _insert_skill(main, "s4", "a", None)
+        with pytest.raises(UniqueViolationError, match=r"Key \(org, slug\)=\(acme, a\)"):
+            _insert_skill(main, "s5", "a", "acme")
+        assert ctx.list_unique_constraints("skills")[0].name == "skills_org_slug_key"
+    finally:
+        ctx.close()
+
+
+def test_unique_declared_on_existing_rows_checks_every_live_branch(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend)
+    try:
+        _insert_skill(ctx.checkout("main"), "s1", "a")
+        ctx.create_branch("exp", from_branch="main")
+        _insert_skill(ctx.checkout("exp"), "s2", "a")
+        with pytest.raises(UniqueViolationError, match="duplicated on branch exp"):
+            ctx.declare_unique("skills", ["slug"])
+        assert ctx.list_unique_constraints("skills") == []
+        ctx.checkout("exp").execute("DELETE FROM skills WHERE id = 's2'")
+        info = ctx.declare_unique("skills", ["slug"])
+        assert info == UniqueConstraintInfo("skills_slug_key", "skills", ("slug",))
+        # Declaring it again is a no-op; reusing the name for other columns is not.
+        ctx.declare_unique("skills", ["slug"])
+        with pytest.raises(ValueError, match="other columns"):
+            ctx.declare_unique("skills", ["org"], name="skills_slug_key")
+        with pytest.raises(UniqueViolationError):
+            _insert_skill(ctx.checkout("exp"), "s3", "a")
+        assert ("slug",) in {index.columns for index in ctx.list_indexes("skills")}
+    finally:
+        ctx.close()
+
+
+def test_tables_without_unique_keep_duplicates_and_add_no_metadata(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend)
+    try:
+        main = ctx.checkout("main")
+        _insert_skill(main, "s1", "a")
+        _insert_skill(main, "s2", "a")
+        assert _skill_ids(main) == ["s1", "s2"]
+        assert ctx.list_unique_constraints() == []
+        assert not _table_exists(ctx, "_chronos_branch_unique_constraints")
+        # The primary key alone is not a UNIQUE constraint.
+        ctx.db.execute("CREATE TABLE plain (id TEXT PRIMARY KEY, v TEXT)")
+        ctx.db.commit()
+        ctx.register_table("plain", ["id"], unique=[["id"]])
+        assert ctx.list_unique_constraints("plain") == []
+    finally:
+        ctx.close()
+
+
+def _diverged_skills(sql_backend: str) -> ChronosBranchContext:
+    """main and agent each add a web-search row after agent forked."""
+
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    _insert_skill(ctx.checkout("main"), "base", "base")
+    ctx.create_branch("agent", from_branch="main")
+    _insert_skill(ctx.checkout("main"), "m1", "web-search")
+    _insert_skill(ctx.checkout("agent"), "a1", "web-search")
+    _insert_skill(ctx.checkout("agent"), "a2", "fine")
+    return ctx
+
+
+def test_merge_that_would_duplicate_is_a_conflict(sql_backend: str) -> None:
+    ctx = _diverged_skills(sql_backend)
+    try:
+        preview = ctx.merge_preview("agent", "main")
+        assert [change.key for change in preview.changes] == [{"id": "a2"}]
+        assert [conflict.key for conflict in preview.conflicts] == [{"id": "a1"}]
+        with pytest.raises(BranchingError, match="skills_slug_key"):
+            ctx.merge_apply("agent", "main")
+        with pytest.raises(BranchingError):
+            ctx.merge_apply("agent", "main", policy="abort_on_conflict")
+        assert _skill_ids(ctx.checkout("main")) == ["base", "m1"]
+        # Taking the source side anyway is still refused at write time.
+        with pytest.raises(UniqueViolationError):
+            ctx.merge_apply("agent", "main", policy="source_wins")
+        assert _skill_ids(ctx.checkout("main")) == ["base", "m1"]
+        # target_wins drops the clashing row and applies the rest.
+        ctx.merge_apply("agent", "main", policy="target_wins")
+        assert _skill_ids(ctx.checkout("main")) == ["a2", "base", "m1"]
+    finally:
+        ctx.close()
+
+
+def test_merge_may_move_a_value_between_rows(sql_backend: str) -> None:
+    ctx = _make_skills_context(sql_backend, unique=[["slug"]])
+    try:
+        _insert_skill(ctx.checkout("main"), "old", "web-search")
+        ctx.create_branch("agent", from_branch="main")
+        agent = ctx.checkout("agent")
+        agent.execute("DELETE FROM skills WHERE id = 'old'")
+        _insert_skill(agent, "new", "web-search")
+        preview = ctx.merge_preview("agent", "main")
+        assert preview.conflicts == []
+        ctx.merge_apply("agent", "main")
+        assert _skill_ids(ctx.checkout("main")) == ["new"]
+    finally:
+        ctx.close()
+
+
+def test_keep_branch_merge_refuses_a_duplicate_and_then_continues(sql_backend: str) -> None:
+    ctx = _diverged_skills(sql_backend)
+    try:
+        with pytest.raises(BranchingError):
+            ctx.merge_apply("agent", "main", keep_branch=True)
+        assert _skill_ids(ctx.checkout("main")) == ["base", "m1"]
+        ctx.checkout("agent").execute("UPDATE skills SET slug = 'renamed' WHERE id = 'a1'")
+        ctx.merge_apply("agent", "main", keep_branch=True)
+        assert _skill_ids(ctx.checkout("main")) == ["a1", "a2", "base", "m1"]
+        with pytest.raises(UniqueViolationError):
+            _insert_skill(ctx.checkout("agent"), "a3", "web-search")
+    finally:
+        ctx.close()
+
+
+def test_atomic_merge_reports_and_refuses_a_duplicate(sql_backend: str, tmp_path) -> None:
+    from chronos_core.workspace import ChronosWorkspaceContext
+
+    if sql_backend == "postgres":
+        _reset_postgres_schema()
+        url = _postgres_dsn()
+    else:
+        url = f"sqlite:///{tmp_path / 'atomic.sqlite'}"
+    ctx = ChronosBranchContext.connect(url, backend="interval")
+    ctx.db.execute("CREATE TABLE skills (id TEXT PRIMARY KEY, slug TEXT, org TEXT, name TEXT)")
+    ctx.db.commit()
+    ctx.register_table("skills", ["id"], unique=[["slug"]])
+    workspace = ChronosWorkspaceContext(stores={"db": ctx}, shared_metadata_url=url)
+    try:
+        _insert_skill(ctx.checkout("main"), "base", "base")
+        workspace.create_branch("agent", "main")
+        _insert_skill(ctx.checkout("main"), "m1", "web-search")
+        _insert_skill(ctx.checkout("agent"), "a1", "web-search")
+        preview = workspace.merge_atomic_preview("agent", "main")
+        assert [c.key for c in preview.stores["db"].conflicts] == [{"id": "a1"}]
+        with pytest.raises(Exception):
+            workspace.merge_atomic(
+                "agent", "main", preview_token=preview.preview_token, operation_id="dup"
+            )
+        assert _skill_ids(ctx.checkout("main")) == ["base", "m1"]
+        with pytest.raises(UniqueViolationError):
+            workspace.merge_atomic(
+                "agent", "main", policy="source_wins", operation_id="dup-source"
+            )
+        assert _skill_ids(ctx.checkout("main")) == ["base", "m1"]
+    finally:
+        workspace.close()
+
+
+def test_postgres_concurrent_writers_cannot_both_insert_a_value() -> None:
+    ctx = _make_skills_context("postgres", unique=[["slug"]])
+    other = ChronosBranchContext.connect(_postgres_dsn(), backend="interval")
+    try:
+        first = ctx.checkout("main")
+        second = other.checkout("main")
+        outcome: dict[str, object] = {}
+        started = threading.Event()
+
+        def write_second() -> None:
+            started.set()
+            try:
+                _insert_skill(second, "s2", "contended")
+                outcome["second"] = "inserted"
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcome["second"] = exc
+
+        with first.transaction():
+            _insert_skill(first, "s1", "contended")
+            thread = threading.Thread(target=write_second)
+            thread.start()
+            started.wait(5)
+            time.sleep(0.5)
+            # The second writer waits on the (branch, table) lock.
+            assert "second" not in outcome
+        thread.join(30)
+        assert isinstance(outcome["second"], UniqueViolationError)
+        assert _skill_ids(ctx.checkout("main")) == ["s1"]
+        # The same value on another branch does not wait for this one.
+        ctx.create_branch("elsewhere", from_branch="main")
+        with first.transaction():
+            _insert_skill(first, "s3", "busy")
+            _insert_skill(other.checkout("elsewhere"), "e1", "busy")
+    finally:
+        other.close()
         ctx.close()

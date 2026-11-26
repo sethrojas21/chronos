@@ -285,6 +285,9 @@ class NativeBranchStoreImpl {
     NativeSqlDriver *driver_ = nullptr;
     bool create_secondary_indexes_ = true;
     bool create_writer_segment_index_ = true;
+    // Once the metadata store has _chronos_branch_unique_constraints it keeps
+    // it, so a positive lookup is cached; a negative one is rechecked.
+    bool unique_constraints_table_seen_ = false;
     int interval_coordinate_bits_ = 0;
     std::array<int, 3> reserve_bits_;
     std::uint64_t transaction_generation_ = 0;

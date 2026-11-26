@@ -489,10 +489,48 @@ class _IntervalBackend(_SQLBranchBackend):
                 message = str(exc)
                 if "primary key columns missing" in message:
                     raise TableNotRegisteredError(message) from exc
+                unique = _unique_violation(exc)
+                if unique is not None:
+                    raise unique from exc
                 raise
             self.refresh_registries()
             return
         raise BranchingError("native interval branch store is unavailable")
+
+    def declare_unique_constraint(
+        self, table: str, name: str, columns: list[str]
+    ) -> None:
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        try:
+            self._native_branch_store.declare_unique_constraint(table, name, columns)
+        except ValueError:
+            raise
+        except Exception as exc:
+            unique = _unique_violation(exc)
+            if unique is not None:
+                raise unique from exc
+            message = str(exc)
+            if "table does not exist" in message:
+                raise TableNotRegisteredError(message) from exc
+            raise
+        # Cached sessions hold table metadata; reload it so the constraint
+        # applies to this process's next write.
+        self._invalidate_native_branch_sessions()
+
+    def list_unique_constraints(
+        self, table: str | None = None
+    ) -> list[UniqueConstraintInfo]:
+        if self._native_branch_store is None:
+            raise BranchingError("native interval branch store is unavailable")
+        return [
+            UniqueConstraintInfo(
+                name=str(item["name"]),
+                table=str(item["table"]),
+                columns=tuple(item["columns"]),
+            )
+            for item in self._native_branch_store.list_unique_constraints(table or "")
+        ]
 
     def create_index(
         self, table: str, columns: list[str], name: str | None = None
@@ -1075,6 +1113,9 @@ class _IntervalBackend(_SQLBranchBackend):
                         self._native_branch_store.rollback()
                 except Exception:
                     pass
+            unique = _unique_violation(exc)
+            if unique is not None:
+                raise unique from exc
             if "duplicate key" in str(exc).lower():
                 raise DuplicateKeyError(str(exc)) from exc
             if "unsupported native branch SQL statement" in str(exc):
@@ -1267,12 +1308,18 @@ class _IntervalBackend(_SQLBranchBackend):
     ) -> int:
         if self._native_branch_store is None:
             raise BranchingError("native interval branch store is unavailable")
-        return int(
-            self._native_branch_store.stage_branch_transaction_changes(
-                transaction._native,
-                [self._row_diff_to_native_dict(change) for change in changes],
+        try:
+            return int(
+                self._native_branch_store.stage_branch_transaction_changes(
+                    transaction._native,
+                    [self._row_diff_to_native_dict(change) for change in changes],
+                )
             )
-        )
+        except Exception as exc:
+            unique = _unique_violation(exc)
+            if unique is not None:
+                raise unique from exc
+            raise
 
     def publish_branch_transaction(self, transaction: BranchTransaction) -> None:
         if self._native_branch_store is None:
@@ -1320,6 +1367,11 @@ class _IntervalBackend(_SQLBranchBackend):
             applied = int(self._native_branch_store.merge_apply(source, target))
         except Exception as exc:
             message = str(exc)
+            unique = _unique_violation(exc)
+            if unique is not None:
+                raise UniqueViolationError(
+                    f"merge has unresolved conflicts: {unique}"
+                ) from exc
             if "chronos_native_merge_conflict" in message:
                 raise BranchingError(
                     "write-write conflict during native interval merge"
@@ -1355,6 +1407,9 @@ class _IntervalBackend(_SQLBranchBackend):
             return applied
         except Exception as exc:
             message = str(exc)
+            unique = _unique_violation(exc)
+            if unique is not None:
+                raise unique from exc
             if "chronos_native_merge_unsupported" in message:
                 raise UnsupportedSQLError(message) from exc
             if "chronos_native_merge_preview_stale" in message:
@@ -1420,17 +1475,20 @@ class _IntervalBackend(_SQLBranchBackend):
                     rows,
                 )
                 return True
-            except Exception:
+            except Exception as exc:
                 if started_native_tx:
                     try:
                         native_session.rollback()
-                    except Exception:
+                    except Exception as exc:
                         pass
                 if started_db_tx:
                     try:
                         self.db.rollback()
-                    except Exception:
+                    except Exception as exc:
                         pass
+                unique = _unique_violation(exc)
+                if unique is not None:
+                    raise unique from exc
                 raise
         raise BranchingError("native interval DML executor is unavailable")
 
@@ -1480,17 +1538,20 @@ class _IntervalBackend(_SQLBranchBackend):
                         [replacement],
                     )
                 return True
-            except Exception:
+            except Exception as exc:
                 if started_native_tx:
                     try:
                         native_session.rollback()
-                    except Exception:
+                    except Exception as exc:
                         pass
                 if started_db_tx:
                     try:
                         self.db.rollback()
-                    except Exception:
+                    except Exception as exc:
                         pass
+                unique = _unique_violation(exc)
+                if unique is not None:
+                    raise unique from exc
                 raise
         raise BranchingError("native interval DML executor is unavailable")
 

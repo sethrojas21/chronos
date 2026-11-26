@@ -26,6 +26,30 @@ def _session_epoch_operation(method: Any) -> Any:
     return wrapped
 
 
+def _unique_column_sets(
+    unique: Sequence[Sequence[str]] | None, primary_key: Sequence[str]
+) -> list[list[str]]:
+    """Distinct UNIQUE column sets, without one that is the primary key."""
+
+    if unique is None:
+        return []
+    if isinstance(unique, str):
+        raise TypeError("unique takes a list of column lists, such as [['slug']]")
+    sets: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for columns in unique:
+        if isinstance(columns, str):
+            raise TypeError("unique takes a list of column lists, such as [['slug']]")
+        key = tuple(str(column) for column in columns)
+        if not key:
+            raise ValueError("a UNIQUE constraint needs at least one column")
+        if key == tuple(primary_key) or key in seen:
+            continue
+        seen.add(key)
+        sets.append(list(key))
+    return sets
+
+
 def _is_retryable_interval_unique_violation(exc: Exception) -> bool:
     message = str(exc)
     return (
@@ -588,7 +612,29 @@ class ChronosBranchContext:
         if callable(wait_gc):
             wait_gc()
 
-    def register_table(self, table: str, primary_key: list[str]) -> None:
+    def register_table(
+        self,
+        table: str,
+        primary_key: list[str],
+        unique: Sequence[Sequence[str]] | None = None,
+    ) -> None:
+        """Register a table for branching.
+
+        unique lists column sets that must stay unique within each branch,
+        as UNIQUE does in a single database: unique=[["slug"], ["a", "b"]].
+        NULLs never conflict, and the same values on two branches are fine.
+        Each set becomes a constraint named as PostgreSQL names it
+        (table_col_key) with a Chronos index on its columns. Declaring one on
+        a table that already holds rows checks every live branch first and
+        raises UniqueViolationError if any branch has duplicates. A set equal
+        to the primary key is already unique and is skipped.
+        """
+
+        unique_sets = _unique_column_sets(unique, primary_key)
+        if unique_sets and self._backend.name != "interval":
+            raise UnsupportedSQLError(
+                "UNIQUE constraints are enforced only by the interval backend"
+            )
         try:
             with _chronos_metadata_lock(self._db):
                 self._backend.refresh_registries()
@@ -598,6 +644,67 @@ class ChronosBranchContext:
             self._rollback_autocommit()
             raise
         self._metadata_epoch += 1
+        for columns in unique_sets:
+            self.declare_unique(table, columns)
+        if not unique_sets and self._backend.name == "interval":
+            # Constraints declared before registration (as `chronos table
+            # create` does) were checked by the backend; index them now.
+            self._ensure_unique_indexes(table)
+
+    def declare_unique(
+        self, table: str, columns: Sequence[str], name: str | None = None
+    ) -> UniqueConstraintInfo:
+        """Declare UNIQUE (columns) on table, enforced within each branch.
+
+        On a registered table every live branch is checked first and
+        UniqueViolationError is raised if one holds duplicates. On a table not
+        yet registered the declaration is recorded and enforced once
+        register_table runs (which then checks the rows it adopts). A Chronos
+        index on the columns is created when the table is registered and has
+        none. Declaring the same name and columns again is a no-op.
+        """
+
+        columns = [str(column) for column in columns]
+        name = name or unique_constraint_name(table, columns)
+        try:
+            with _chronos_metadata_lock(self._db):
+                self._backend.refresh_registries()
+                self._backend.declare_unique_constraint(table, name, columns)
+                self._commit_autocommit()
+        except Exception:
+            self._rollback_autocommit()
+            raise
+        self._metadata_epoch += 1
+        self._ensure_unique_indexes(table)
+        return UniqueConstraintInfo(name=name, table=table, columns=tuple(columns))
+
+    def list_unique_constraints(
+        self, table: str | None = None
+    ) -> list[UniqueConstraintInfo]:
+        """UNIQUE constraints declared on table (or on every table)."""
+
+        return self._backend.list_unique_constraints(table)
+
+    def _ensure_unique_indexes(self, table: str) -> None:
+        """Give each UNIQUE constraint of a registered table an index on its
+        columns (named per schema, as the gateway's shared DDL names them),
+        so the write-time check is an index lookup."""
+
+        self._backend.refresh_registries()
+        if table not in self._backend.tables:
+            return
+        indexed = {
+            tuple(index.columns)
+            for index in self._backend.indexes.values()
+            if index.table == table
+        }
+        for constraint in self.list_unique_constraints(table):
+            if constraint.columns in indexed:
+                continue
+            schema, _, _ = table.rpartition(".")
+            name = f"{schema}.{constraint.name}" if schema else constraint.name
+            self.create_index(table, list(constraint.columns), name)
+            indexed.add(constraint.columns)
 
     def describe_table(self, table: str) -> TableInfo:
         """Describe a table from Chronos's registry, or the database if unregistered.

@@ -25,6 +25,8 @@ from chronos_core.branching._runtime import (
     TableColumn,
     TableInfo,
     TableNotRegisteredError,
+    UniqueConstraintInfo,
+    UniqueViolationError,
     UnsupportedSQLError,
 )
 from chronos_core.branching.interval_protocols import (
@@ -59,5 +61,7 @@ __all__ = [
     "TableColumn",
     "TableInfo",
     "TableNotRegisteredError",
+    "UniqueConstraintInfo",
+    "UniqueViolationError",
     "UnsupportedSQLError",
 ]

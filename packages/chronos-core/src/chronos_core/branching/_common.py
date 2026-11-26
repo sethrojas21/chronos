@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 import operator
-from typing import Any, Iterator, Literal, Protocol
+from typing import Any, Iterator, Literal, Protocol, Sequence
 
 import sqlglot
 from sqlglot import exp
@@ -117,6 +117,44 @@ class UnsupportedSQLError(BranchingError):
 
 class DuplicateKeyError(BranchingError):
     """Raised when a branch-local insert violates a logical primary key."""
+
+
+class UniqueViolationError(BranchingError):
+    """Raised when a write or merge would put two rows with the same UNIQUE
+    values on one branch, or a UNIQUE constraint cannot be declared because a
+    branch already holds duplicates."""
+
+    # PostgreSQL's unique_violation, reported to SQL clients of the gateway.
+    sqlstate = "23505"
+
+
+_UNIQUE_VIOLATION_MARKER = "chronos_unique_violation: "
+
+
+def _unique_violation(exc: BaseException) -> UniqueViolationError | None:
+    """The UniqueViolationError a native error stands for, if it is one."""
+
+    message = str(exc)
+    at = message.find(_UNIQUE_VIOLATION_MARKER)
+    if at < 0:
+        return None
+    return UniqueViolationError(message[at + len(_UNIQUE_VIOLATION_MARKER):])
+
+
+@dataclass(frozen=True)
+class UniqueConstraintInfo:
+    """A UNIQUE constraint declared on a table, enforced within each branch."""
+
+    name: str
+    table: str
+    columns: tuple[str, ...]
+
+
+def unique_constraint_name(table: str, columns: Sequence[str]) -> str:
+    """PostgreSQL's default name for UNIQUE (columns) on table: table_col_key."""
+
+    bare = table.rpartition(".")[2]
+    return f"{bare}_{'_'.join(columns)}_key"
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1039,18 @@ class _SQLBranchBackend:
 
     def register_table(self, table: str, primary_key: list[str]) -> None:
         raise NotImplementedError
+
+    def declare_unique_constraint(
+        self, table: str, name: str, columns: list[str]
+    ) -> None:
+        raise UnsupportedSQLError(
+            f"UNIQUE constraints are enforced only by the interval backend, not {self.name}"
+        )
+
+    def list_unique_constraints(
+        self, table: str | None = None
+    ) -> list[UniqueConstraintInfo]:
+        return []
 
     def create_branch(
         self,

@@ -633,6 +633,7 @@
                     }
                     preserve_existing_logical_indexes(table, source_indexes);
                 }
+                validate_declared_unique_constraints(table);
                 if (started_tx) driver_->execute("COMMIT");
                 return;
             }
@@ -670,6 +671,7 @@
             if (create_secondary_indexes()) {
                 preserve_existing_logical_indexes(table, source_indexes);
             }
+            validate_declared_unique_constraints(table);
             if (started_tx) driver_->execute("COMMIT");
         } catch (...) {
             if (started_tx) {
@@ -679,6 +681,466 @@
                 }
             }
             throw;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // UNIQUE constraints, enforced within each branch.
+    //
+    //   _chronos_branch_unique_constraints (metadata store, created on first
+    //   declaration; absent in stores that never declared one)
+    //       backend TEXT NOT NULL
+    //       table_name TEXT NOT NULL
+    //       constraint_name TEXT NOT NULL
+    //       columns TEXT NOT NULL          JSON string array
+    //       PRIMARY KEY (backend, table_name, constraint_name)
+    //
+    // A branch may not hold two visible rows with the same non-NULL values in
+    // a constraint's columns; NULLs never conflict, as in PostgreSQL. Writes
+    // check before they splice (find_unique_clashes), so a refused write leaves
+    // no rows behind even inside an open transaction. Tables without a
+    // constraint pay nothing at write time.
+    // ---------------------------------------------------------------------
+
+    struct NativeUniqueClash {
+        std::size_t row_index = 0;
+        std::string message;
+    };
+
+    static constexpr const char *kUniqueViolationMarker = "chronos_unique_violation: ";
+
+    bool unique_constraints_table_exists() {
+        if (unique_constraints_table_seen_) return true;
+        unique_constraints_table_seen_ = table_exists("_chronos_branch_unique_constraints");
+        return unique_constraints_table_seen_;
+    }
+
+    void ensure_unique_constraints_table() {
+        driver_->execute(
+            "CREATE TABLE IF NOT EXISTS _chronos_branch_unique_constraints ("
+            "backend TEXT NOT NULL, "
+            "table_name TEXT NOT NULL, "
+            "constraint_name TEXT NOT NULL, "
+            "columns TEXT NOT NULL, "
+            "PRIMARY KEY (backend, table_name, constraint_name))"
+        );
+        unique_constraints_table_seen_ = true;
+    }
+
+    std::vector<NativeUniqueConstraint> load_unique_constraints(const std::string &table) {
+        if (!unique_constraints_table_exists()) return {};
+        auto rows = driver_->query(
+            "SELECT constraint_name, columns FROM _chronos_branch_unique_constraints "
+            "WHERE backend = 'interval' AND table_name = ? ORDER BY constraint_name",
+            {table}
+        );
+        std::vector<NativeUniqueConstraint> out;
+        out.reserve(rows.size());
+        for (const auto &row : rows) {
+            out.push_back({native_as_string(row[0]), parse_json_string_array(native_as_string(row[1]))});
+        }
+        return out;
+    }
+
+    std::unordered_map<std::string, std::vector<NativeUniqueConstraint>> load_all_unique_constraints() {
+        std::unordered_map<std::string, std::vector<NativeUniqueConstraint>> out;
+        if (!unique_constraints_table_exists()) return out;
+        auto rows = driver_->query(
+            "SELECT table_name, constraint_name, columns FROM _chronos_branch_unique_constraints "
+            "WHERE backend = 'interval' ORDER BY table_name, constraint_name"
+        );
+        for (const auto &row : rows) {
+            out[native_as_string(row[0])].push_back(
+                {native_as_string(row[1]), parse_json_string_array(native_as_string(row[2]))}
+            );
+        }
+        return out;
+    }
+
+    std::vector<chronos::native::NativeUniqueConstraintInfo> list_unique_constraints(const std::string &table) {
+        std::vector<chronos::native::NativeUniqueConstraintInfo> out;
+        if (!unique_constraints_table_exists()) return out;
+        auto rows = table.empty()
+            ? driver_->query(
+                "SELECT table_name, constraint_name, columns FROM _chronos_branch_unique_constraints "
+                "WHERE backend = 'interval' ORDER BY table_name, constraint_name")
+            : driver_->query(
+                "SELECT table_name, constraint_name, columns FROM _chronos_branch_unique_constraints "
+                "WHERE backend = 'interval' AND table_name = ? ORDER BY table_name, constraint_name",
+                {table});
+        for (const auto &row : rows) {
+            out.push_back({
+                native_as_string(row[0]),
+                native_as_string(row[1]),
+                parse_json_string_array(native_as_string(row[2])),
+            });
+        }
+        return out;
+    }
+
+    static std::string unique_value_text(const Value &value) {
+        if (std::holds_alternative<std::monostate>(value)) return "null";
+        if (const auto *v = std::get_if<std::int64_t>(&value)) return std::to_string(*v);
+        if (const auto *v = std::get_if<double>(&value)) {
+            std::ostringstream out;
+            out << *v;
+            return out.str();
+        }
+        if (const auto *v = std::get_if<std::string>(&value)) return *v;
+        if (const auto *v = std::get_if<IntervalDecimal>(&value)) return v->text;
+        if (const auto *v = std::get_if<IntervalDate>(&value)) {
+            char buffer[16];
+            std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d", v->year, v->month, v->day);
+            return buffer;
+        }
+        if (const auto *v = std::get_if<IntervalBlob>(&value)) {
+            static const char *hex = "0123456789abcdef";
+            std::string out = "\\x";
+            for (unsigned char byte : *v) {
+                out += hex[byte >> 4];
+                out += hex[byte & 0x0f];
+            }
+            return out;
+        }
+        return "?";
+    }
+
+    // PostgreSQL's DETAIL wording: Key (a, b)=(1, x).
+    static std::string unique_key_detail(
+        const std::vector<std::string> &columns,
+        const std::vector<Value> &values
+    ) {
+        std::string names;
+        std::string shown;
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (i) {
+                names += ", ";
+                shown += ", ";
+            }
+            names += columns[i];
+            shown += i < values.size() ? unique_value_text(values[i]) : "?";
+        }
+        return "Key (" + names + ")=(" + shown + ")";
+    }
+
+    static std::string unique_violation_message(
+        const NativeUniqueConstraint &constraint,
+        const std::vector<Value> &values,
+        const std::string &detail_suffix
+    ) {
+        return std::string(kUniqueViolationMarker) +
+            "duplicate key value violates unique constraint \"" + constraint.name + "\": " +
+            unique_key_detail(constraint.columns, values) + " " + detail_suffix;
+    }
+
+    // Rows written to a table with UNIQUE constraints on PostgreSQL serialize
+    // per (branch, table) for the rest of the data transaction: the branch
+    // write guard is only FOR SHARE, so two writers could otherwise both pass
+    // the check. SQLite already serializes writers.
+    void lock_unique_writes(const NativeTableMeta &meta, const std::string &branch_id) {
+        if (meta.unique_constraints.empty() || dialect() != "postgres") return;
+        if (!driver().in_transaction()) return;
+        const std::uint64_t key = stable_fnv1a64(
+            std::string("chronos_unique") + '\0' + branch_id + '\0' + meta.logical_name
+        );
+        driver().execute(
+            "SELECT pg_advisory_xact_lock(?::bigint)",
+            {static_cast<std::int64_t>(key)}
+        );
+    }
+
+    // Rows that would break a UNIQUE constraint of meta once `rows` (live
+    // versions laid out as `columns`) become visible at branch_point.
+    // Current versions of the primary keys in `replaced` are not compared:
+    // this write replaces or deletes them. A row whose only match is its own
+    // current version (same primary key) is left to the primary-key check.
+    std::vector<NativeUniqueClash> find_unique_clashes(
+        const NativeTableMeta &meta,
+        const std::vector<std::string> &columns,
+        const std::vector<std::string> &pk_columns,
+        const NativeRows &rows,
+        const NativeRows &replaced,
+        const std::string &branch_point,
+        const std::string &where,
+        bool stop_at_first
+    ) {
+        std::vector<NativeUniqueClash> clashes;
+        if (meta.unique_constraints.empty() || rows.empty()) return clashes;
+        std::vector<std::size_t> pk_indices;
+        pk_indices.reserve(pk_columns.size());
+        for (const auto &pk : pk_columns) pk_indices.push_back(column_index(columns, pk));
+        auto pk_of = [&pk_indices](const std::vector<Value> &row) {
+            NativeRowKey key;
+            key.values.reserve(pk_indices.size());
+            for (auto index : pk_indices) key.values.push_back(row[index]);
+            return key;
+        };
+        std::unordered_set<NativeRowKey, NativeRowKeyHash> replaced_keys;
+        replaced_keys.reserve(replaced.size());
+        for (const auto &row : replaced) replaced_keys.insert(pk_of(row));
+        std::unordered_set<std::size_t> clashed_rows;
+
+        for (const auto &constraint : meta.unique_constraints) {
+            std::vector<std::size_t> indices;
+            indices.reserve(constraint.columns.size());
+            bool constraint_columns_present = true;
+            for (const auto &column : constraint.columns) {
+                auto found = std::find(columns.begin(), columns.end(), column);
+                if (found == columns.end()) {
+                    constraint_columns_present = false;
+                    break;
+                }
+                indices.push_back(static_cast<std::size_t>(found - columns.begin()));
+            }
+            if (!constraint_columns_present) {
+                throw std::runtime_error(
+                    "unique constraint " + constraint.name + " names a column missing from the write to " +
+                    meta.logical_name
+                );
+            }
+
+            // Duplicates within the write itself; the first row keeps the value.
+            std::unordered_map<NativeRowKey, std::size_t, NativeRowKeyHash> first_with_value;
+            std::vector<std::size_t> candidates;
+            candidates.reserve(rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (clashed_rows.count(i)) continue;
+                NativeRowKey value;
+                value.values.reserve(indices.size());
+                bool has_null = false;
+                for (auto index : indices) {
+                    if (std::holds_alternative<std::monostate>(rows[i][index])) has_null = true;
+                    value.values.push_back(rows[i][index]);
+                }
+                if (has_null) continue;
+                auto [it, inserted] = first_with_value.emplace(std::move(value), i);
+                if (!inserted) {
+                    clashed_rows.insert(i);
+                    clashes.push_back({i, unique_violation_message(
+                        constraint, it->first.values, "appears more than once in this write " + where)});
+                    if (stop_at_first) return clashes;
+                    continue;
+                }
+                candidates.push_back(i);
+            }
+
+            // One indexed lookup per chunk of written values against the rows
+            // already visible on the branch.
+            constexpr std::size_t kChunk = 128;
+            for (std::size_t start = 0; start < candidates.size(); start += kChunk) {
+                const std::size_t end = std::min(candidates.size(), start + kChunk);
+                std::string sql = "SELECT ";
+                for (std::size_t i = 0; i < pk_columns.size(); ++i) {
+                    if (i) sql += ", ";
+                    sql += quote_ident(pk_columns[i]);
+                }
+                for (const auto &column : constraint.columns) sql += ", " + quote_ident(column);
+                sql += " FROM " + quote_ident(meta.physical_name) + " WHERE (";
+                std::vector<Value> bound;
+                bound.reserve((end - start) * indices.size());
+                if (indices.size() == 1) {
+                    sql += quote_ident(constraint.columns[0]) + " IN (";
+                    for (std::size_t c = start; c < end; ++c) {
+                        if (c != start) sql += ", ";
+                        sql += "?";
+                        bound.push_back(rows[candidates[c]][indices[0]]);
+                    }
+                    sql += ")";
+                } else {
+                    for (std::size_t c = start; c < end; ++c) {
+                        if (c != start) sql += " OR ";
+                        sql += "(";
+                        for (std::size_t k = 0; k < indices.size(); ++k) {
+                            if (k) sql += " AND ";
+                            sql += quote_ident(constraint.columns[k]) + " = ?";
+                            bound.push_back(rows[candidates[c]][indices[k]]);
+                        }
+                        sql += ")";
+                    }
+                }
+                sql += ") AND " + visible_where_sql(branch_point);
+                auto found_rows = driver().query(sql, bound);
+                for (const auto &found : found_rows) {
+                    NativeRowKey found_pk;
+                    found_pk.values.assign(found.begin(), found.begin() + static_cast<std::ptrdiff_t>(pk_columns.size()));
+                    if (replaced_keys.count(found_pk)) continue;
+                    NativeRowKey found_value;
+                    found_value.values.assign(found.begin() + static_cast<std::ptrdiff_t>(pk_columns.size()), found.end());
+                    auto writer = first_with_value.find(found_value);
+                    std::size_t row_index = candidates[start];
+                    if (writer != first_with_value.end()) {
+                        row_index = writer->second;
+                        // The row's own current version: a primary-key matter.
+                        if (pk_of(rows[row_index]) == found_pk) continue;
+                    }
+                    if (clashed_rows.count(row_index)) continue;
+                    clashed_rows.insert(row_index);
+                    clashes.push_back({row_index, unique_violation_message(
+                        constraint, found_value.values, "already exists " + where)});
+                    if (stop_at_first) return clashes;
+                }
+            }
+        }
+        std::sort(clashes.begin(), clashes.end(), [](const NativeUniqueClash &a, const NativeUniqueClash &b) {
+            return a.row_index < b.row_index;
+        });
+        return clashes;
+    }
+
+    void require_unique_rows(
+        const NativeTableMeta &meta,
+        const std::vector<std::string> &columns,
+        const std::vector<std::string> &pk_columns,
+        const NativeRows &rows,
+        const NativeRows &replaced,
+        const std::string &branch_point,
+        const std::string &where
+    ) {
+        auto clashes = find_unique_clashes(
+            meta, columns, pk_columns, rows, replaced, branch_point, where, true
+        );
+        if (!clashes.empty()) throw std::runtime_error(clashes.front().message);
+    }
+
+    // Declare UNIQUE (columns) on a table. A registered table is checked on
+    // every live branch first and the declaration is refused if any branch
+    // already holds duplicates. An unregistered table only records the
+    // declaration (as `chronos table create` does before `table register`);
+    // it is enforced once the table is registered. Declaring the same name
+    // with the same columns again is a no-op.
+    void declare_unique_constraint(
+        const std::string &table,
+        const std::string &name,
+        const std::vector<std::string> &columns
+    ) {
+        if (name.empty()) throw std::invalid_argument("unique constraint name cannot be empty");
+        if (columns.empty()) throw std::invalid_argument("unique constraint columns cannot be empty");
+        std::unordered_set<std::string> distinct(columns.begin(), columns.end());
+        if (distinct.size() != columns.size()) {
+            throw std::invalid_argument("unique constraint columns repeat a column: " + name);
+        }
+        const bool started_tx = !driver_->in_transaction();
+        if (started_tx) driver_->execute(metadata_dialect() == "sqlite" ? "BEGIN IMMEDIATE" : "BEGIN");
+        try {
+            // Callers serialize declarations under the Python metadata lock
+            // (the same advisory lock lock_schema_metadata takes, held on the
+            // adapter's connection), as for create_index.
+            ensure_unique_constraints_table();
+            auto existing = driver_->query(
+                "SELECT columns FROM _chronos_branch_unique_constraints "
+                "WHERE backend = 'interval' AND table_name = ? AND constraint_name = ?",
+                {table, name}
+            );
+            if (!existing.empty()) {
+                if (parse_json_string_array(native_as_string(existing[0][0])) != columns) {
+                    throw std::invalid_argument(
+                        "unique constraint " + name + " already exists on " + table + " with other columns"
+                    );
+                }
+                if (started_tx) driver_->execute("COMMIT");
+                return;
+            }
+            auto registered = driver_->query(
+                "SELECT 1 FROM _chronos_branch_tables WHERE backend = 'interval' AND table_name = ?",
+                {table}
+            );
+            if (registered.empty()) {
+                driver().refresh_catalog();
+                auto [table_columns, _] = table_defs(table);
+                if (table_columns.empty()) {
+                    throw std::runtime_error("table does not exist: " + table);
+                }
+                for (const auto &column : columns) {
+                    if (std::find(table_columns.begin(), table_columns.end(), column) == table_columns.end()) {
+                        throw std::invalid_argument("unique constraint columns missing from " + table + ": " + column);
+                    }
+                }
+            } else {
+                validate_unique_on_live_branches(table, name, columns);
+            }
+            driver_->execute(
+                "INSERT INTO _chronos_branch_unique_constraints "
+                "(backend, table_name, constraint_name, columns) VALUES ('interval', ?, ?, ?)",
+                {table, name, json_string_array(columns)}
+            );
+            if (started_tx) driver_->execute("COMMIT");
+        } catch (...) {
+            // The rollback may have undone the table's creation.
+            unique_constraints_table_seen_ = false;
+            if (started_tx) {
+                try { driver_->execute("ROLLBACK"); } catch (...) {}
+            }
+            throw;
+        }
+    }
+
+    // Refuse a merge whose rows would break a UNIQUE constraint of the target:
+    // the target's visible rows (except those the merge replaces or deletes)
+    // and the merged rows are compared at the target's pre-merge read point.
+    void require_unique_after_merge(
+        const NativeTableMeta &meta,
+        const NativeRows &upserts,
+        const NativeRows &deletes,
+        const std::string &target_branch_point,
+        const std::string &where
+    ) {
+        if (meta.unique_constraints.empty() || upserts.empty()) return;
+        NativeRows replaced = upserts;
+        replaced.insert(replaced.end(), deletes.begin(), deletes.end());
+        require_unique_rows(
+            meta, meta.columns, meta.pk_columns, upserts, replaced, target_branch_point, where
+        );
+    }
+
+    // Recheck every declared constraint of a table on every live branch, as
+    // registering a table whose constraints were declared first requires.
+    void validate_declared_unique_constraints(const std::string &table) {
+        for (const auto &constraint : load_unique_constraints(table)) {
+            validate_unique_on_live_branches(table, constraint.name, constraint.columns);
+        }
+    }
+
+    void validate_unique_on_live_branches(
+        const std::string &table,
+        const std::string &name,
+        const std::vector<std::string> &columns
+    ) {
+        std::unordered_set<std::string> checked;
+        for (const auto &branch_id : branches()) {
+            const NativeBranchSegment segment = load_segment(branch_id);
+            NativeTableMeta meta;
+            try {
+                meta = load_table_meta_without_constraints(table, segment);
+            } catch (const std::runtime_error &) {
+                continue;  // not visible on this branch
+            }
+            for (const auto &column : columns) {
+                if (std::find(meta.columns.begin(), meta.columns.end(), column) == meta.columns.end()) {
+                    throw std::invalid_argument("unique constraint columns missing from " + table + ": " + column);
+                }
+            }
+            if (!checked.insert(meta.physical_name + '\0' + segment.branch_point).second) continue;
+            std::string quoted;
+            std::string not_null;
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                if (i) {
+                    quoted += ", ";
+                    not_null += " AND ";
+                }
+                quoted += quote_ident(columns[i]);
+                not_null += quote_ident(columns[i]) + " IS NOT NULL";
+            }
+            auto duplicate = driver().query(
+                "SELECT " + quoted + " FROM " + quote_ident(meta.physical_name) +
+                " WHERE " + not_null + " AND " + visible_where_sql(segment.branch_point) +
+                " GROUP BY " + quoted + " HAVING COUNT(*) > 1 LIMIT 1"
+            );
+            if (!duplicate.empty()) {
+                throw std::runtime_error(
+                    std::string(kUniqueViolationMarker) + "could not create unique constraint \"" + name +
+                    "\": " + unique_key_detail(columns, duplicate[0]) + " is duplicated on branch " + branch_id
+                );
+            }
         }
     }
 
@@ -751,6 +1213,27 @@
     }
 
     NativeTableMeta load_table_meta(const std::string &logical_table, const NativeBranchSegment &segment) {
+        NativeTableMeta meta = load_table_meta_without_constraints(logical_table, segment);
+        meta.unique_constraints = load_unique_constraints(logical_table);
+        return meta;
+    }
+
+    std::vector<NativeTableMeta> load_table_metas(const NativeBranchSegment &segment) {
+        std::vector<NativeTableMeta> metas = load_table_metas_without_constraints(segment);
+        if (metas.empty()) return metas;
+        auto constraints = load_all_unique_constraints();
+        if (constraints.empty()) return metas;
+        for (auto &meta : metas) {
+            auto found = constraints.find(meta.logical_name);
+            if (found != constraints.end()) meta.unique_constraints = found->second;
+        }
+        return metas;
+    }
+
+    NativeTableMeta load_table_meta_without_constraints(
+        const std::string &logical_table,
+        const NativeBranchSegment &segment
+    ) {
         if (table_exists("_chronos_branch_table_bindings")) {
             auto rows = driver_->query(
                 "SELECT v.physical_table, v.pk_columns, v.columns, v.column_defs, "
@@ -802,7 +1285,7 @@
         };
     }
 
-    std::vector<NativeTableMeta> load_table_metas(const NativeBranchSegment &segment) {
+    std::vector<NativeTableMeta> load_table_metas_without_constraints(const NativeBranchSegment &segment) {
         std::unordered_map<std::string, NativeTableMeta> by_table;
         if (table_exists("_chronos_branch_table_bindings")) {
             // Bulk-load active schema-version bindings.  The old path first
@@ -930,7 +1413,7 @@
         // Keep this as one native metadata pass so Python does not issue its
         // own branch/table-binding SELECTs before every BranchSession checkout.
         std::vector<NativeTableMeta> metas = enable_schema_branching
-            ? load_table_metas(segment)
+            ? load_table_metas_without_constraints(segment)
             : load_base_table_metas();
 
         NativePreparedRefInfo info;
@@ -2946,6 +3429,10 @@
                 }
 
                 if (upserts.empty() && deletes.empty()) continue;
+                require_unique_after_merge(
+                    meta, upserts, deletes, original_target_segment.branch_point,
+                    "on branch " + target + " after merging " + source
+                );
                 applied += static_cast<std::int64_t>(upserts.size() + deletes.size());
                 pending_tables.push_back(PendingMergeTable{
                     meta,
@@ -3222,6 +3709,15 @@
                             change.after_values
                         ));
                     }
+                }
+                if (!meta.unique_constraints.empty() && !upserts.empty()) {
+                    const NativeBranchSegment old_target = load_segment_by_id(
+                        transaction.old_target_segment_id
+                    );
+                    require_unique_after_merge(
+                        meta, upserts, deletes, old_target.branch_point,
+                        "on the target branch after merging"
+                    );
                 }
                 if (!deletes.empty()) {
                     driver().interval_upsert(
@@ -4376,11 +4872,11 @@
         std::optional<NativeTableMeta> left_meta;
         std::optional<NativeTableMeta> right_meta;
         try {
-            left_meta = load_table_meta(table, left_segment);
+            left_meta = load_table_meta_without_constraints(table, left_segment);
         } catch (...) {
         }
         try {
-            right_meta = load_table_meta(table, right_segment);
+            right_meta = load_table_meta_without_constraints(table, right_segment);
         } catch (...) {
         }
         if (!left_meta && !right_meta) return {};
@@ -4512,6 +5008,12 @@
                 return diff_sort_key(a) < diff_sort_key(b);
             });
 
+            const std::size_t first_table_change = preview.changes.size();
+            // Rows each change of this table would make visible in the target
+            // (by index into preview.changes), and the keys it replaces.
+            NativeRows unique_upserts;
+            std::vector<std::size_t> unique_upsert_changes;
+            NativeRows unique_replaced;
             for (const auto &key : ordered_keys) {
                 const NativeMergeRowState base = row_state_for_key(base_rows, key);
                 const NativeMergeRowState source_state = row_state_for_key(source_rows, key);
@@ -4535,12 +5037,43 @@
                 }
                 if (target_state.present == base.present && row_state_equal(target_state, base)) {
                     if (auto diff = row_diff_from_target_to_source(meta, key, target_state, source_state)) {
+                        if (!meta.unique_constraints.empty()) {
+                            if (source_state.present) {
+                                unique_upserts.push_back(source_state.row);
+                                unique_upsert_changes.push_back(preview.changes.size());
+                                unique_replaced.push_back(source_state.row);
+                            } else {
+                                unique_replaced.push_back(tombstone_row_for_key(meta, key));
+                            }
+                        }
                         preview.changes.push_back(std::move(*diff));
                     }
                     continue;
                 }
                 if (auto diff = row_diff_from_target_to_source(meta, key, target_state, source_state)) {
                     preview.conflicts.push_back(std::move(*diff));
+                }
+            }
+            // A change that would leave two rows with the same UNIQUE values
+            // in the target is a conflict, like a write-write conflict.
+            if (!unique_upserts.empty()) {
+                auto clashes = find_unique_clashes(
+                    meta, meta.columns, meta.pk_columns, unique_upserts, unique_replaced,
+                    target_segment.branch_point, "on branch " + target, false
+                );
+                if (!clashes.empty()) {
+                    std::unordered_set<std::size_t> clashing;
+                    for (const auto &clash : clashes) clashing.insert(unique_upsert_changes[clash.row_index]);
+                    std::vector<chronos::native::NativeRowDiff> kept;
+                    for (std::size_t i = first_table_change; i < preview.changes.size(); ++i) {
+                        if (clashing.count(i)) {
+                            preview.conflicts.push_back(std::move(preview.changes[i]));
+                        } else {
+                            kept.push_back(std::move(preview.changes[i]));
+                        }
+                    }
+                    preview.changes.resize(first_table_change);
+                    for (auto &diff : kept) preview.changes.push_back(std::move(diff));
                 }
             }
         }
@@ -4687,6 +5220,10 @@
                             ));
                         }
                     }
+                    require_unique_after_merge(
+                        meta, upserts, deletes, original_target_segment.branch_point,
+                    "on branch " + target + " after merging " + source
+                    );
                     if (!deletes.empty()) {
                         driver().interval_upsert(
                             meta.physical_name,

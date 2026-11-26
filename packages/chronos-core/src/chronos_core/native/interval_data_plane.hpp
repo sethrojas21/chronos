@@ -145,6 +145,13 @@ class NativeBranchStore {
         const std::vector<std::string> &columns,
         const std::string &name = ""
     );
+    // UNIQUE within each branch; see declare_unique_constraint in the store.
+    void declare_unique_constraint(
+        const std::string &table,
+        const std::string &name,
+        const std::vector<std::string> &columns
+    );
+    std::vector<NativeUniqueConstraintInfo> list_unique_constraints(const std::string &table = "");
     std::vector<std::string> branches();
     void create_branch(
         const std::string &branch_id,

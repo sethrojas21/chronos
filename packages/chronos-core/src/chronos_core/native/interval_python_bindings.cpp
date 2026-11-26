@@ -693,6 +693,18 @@ std::string NativeBranchStore::create_index(
     return impl_->create_index(table, columns, name);
 }
 
+void NativeBranchStore::declare_unique_constraint(
+    const std::string &table,
+    const std::string &name,
+    const std::vector<std::string> &columns
+) {
+    impl_->declare_unique_constraint(table, name, columns);
+}
+
+std::vector<NativeUniqueConstraintInfo> NativeBranchStore::list_unique_constraints(const std::string &table) {
+    return impl_->list_unique_constraints(table);
+}
+
 std::vector<std::string> NativeBranchStore::branches() { return impl_->branches(); }
 
 void NativeBranchStore::create_branch(
@@ -1323,6 +1335,34 @@ void bind_interval_data_plane(py::module_ &m) {
             py::arg("columns"),
             py::arg("name") = "",
             py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "declare_unique_constraint",
+            &NativeBranchStore::declare_unique_constraint,
+            py::arg("table"),
+            py::arg("name"),
+            py::arg("columns"),
+            py::call_guard<py::gil_scoped_release>()
+        )
+        .def(
+            "list_unique_constraints",
+            [](NativeBranchStore &store, const std::string &table) {
+                std::vector<NativeUniqueConstraintInfo> constraints;
+                {
+                    py::gil_scoped_release release;
+                    constraints = store.list_unique_constraints(table);
+                }
+                py::list out;
+                for (const auto &constraint : constraints) {
+                    py::dict item;
+                    item["table"] = constraint.table;
+                    item["name"] = constraint.name;
+                    item["columns"] = constraint.columns;
+                    out.append(item);
+                }
+                return out;
+            },
+            py::arg("table") = ""
         )
         .def("branches", &NativeBranchStore::branches, py::call_guard<py::gil_scoped_release>())
         .def(

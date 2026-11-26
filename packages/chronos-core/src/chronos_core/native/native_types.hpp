@@ -134,6 +134,13 @@ struct NativeRowDiff {
     std::vector<std::uint32_t> column_types;
 };
 
+// A declared UNIQUE constraint, as listed to callers.
+struct NativeUniqueConstraintInfo {
+    std::string table;
+    std::string name;
+    std::vector<std::string> columns;
+};
+
 struct NativeMergePreview {
     std::vector<NativeRowDiff> changes;
     std::vector<NativeRowDiff> conflicts;
