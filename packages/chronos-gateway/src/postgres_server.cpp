@@ -120,6 +120,37 @@ void send_error(tcp::socket &socket, const std::string &message, const std::stri
     send_message(socket, 'E', payload);
 }
 
+// The engine reports a UNIQUE constraint broken within a branch as
+// "chronos_unique_violation: duplicate key value violates unique constraint
+// "name": Key (col)=(value) ...". Clients get it as PostgreSQL sends a
+// unique_violation: SQLSTATE 23505, the message, the key as DETAIL, and the
+// constraint name. Returns false for any other error.
+bool send_unique_violation(tcp::socket &socket, const std::string &what) {
+    static const std::string marker = "chronos_unique_violation: ";
+    const auto at = what.find(marker);
+    if (at == std::string::npos) return false;
+    std::string message = what.substr(at + marker.size());
+    std::string detail;
+    std::string constraint;
+    const auto open = message.find('"');
+    const auto close = open == std::string::npos ? std::string::npos : message.find("\": ", open + 1);
+    if (close != std::string::npos) {
+        constraint = message.substr(open + 1, close - open - 1);
+        detail = message.substr(close + 3);
+        message.resize(close + 1);
+    }
+    std::string payload;
+    payload.push_back('S'); append_cstring(payload, "ERROR");
+    payload.push_back('V'); append_cstring(payload, "ERROR");
+    payload.push_back('C'); append_cstring(payload, "23505");
+    payload.push_back('M'); append_cstring(payload, message);
+    if (!detail.empty()) { payload.push_back('D'); append_cstring(payload, detail + "."); }
+    if (!constraint.empty()) { payload.push_back('n'); append_cstring(payload, constraint); }
+    payload.push_back('\0');
+    send_message(socket, 'E', payload);
+    return true;
+}
+
 std::string lower_keyword(const std::string &sql) {
     std::size_t offset = 0;
     while (offset < sql.size()) {
@@ -1043,7 +1074,9 @@ class PostgresServer::Impl {
                     failed_transaction = branch_session->session().in_transaction();
                     const auto *coded = dynamic_cast<const SqlStateError *>(&error);
                     const bool denied = dynamic_cast<const PermissionDenied *>(&error) != nullptr;
-                    send_error(socket, error.what(), coded ? coded->code : (denied ? "42501" : "0A000"));
+                    if (!send_unique_violation(socket, error.what())) {
+                        send_error(socket, error.what(), coded ? coded->code : (denied ? "42501" : "0A000"));
+                    }
                     if (type == 'Q') send_ready(socket, failed_transaction ? 'E' : 'I');
                     else ignore_until_sync = true;
                 }

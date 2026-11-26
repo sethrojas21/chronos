@@ -382,6 +382,10 @@ int main() {
     setup.commit();
     setup.register_table("orders", {"id"});
     setup.register_table("customers", {"id"});
+    setup.execute_sql("CREATE TABLE skills (id TEXT PRIMARY KEY, slug TEXT, name TEXT)");
+    setup.commit();
+    setup.register_table("skills", {"id"});
+    setup.declare_unique_constraint("skills", "skills_slug_key", {"slug"});
 
     GatewayRuntime runtime;
     WorkspaceConfig workspace;
@@ -404,6 +408,47 @@ int main() {
     check(PQresultStatus(selected.get()) == PGRES_TUPLES_OK, PQerrorMessage(connection.get()));
     check(PQntuples(selected.get()) == 1 && std::string(PQgetvalue(selected.get(), 0, 0)) == "open",
           "simple-query SELECT must return branch data");
+
+    // UNIQUE is enforced within the branch and reported as PostgreSQL does.
+    expect_command(connection.get(), "INSERT INTO skills (id, slug) VALUES ('s1', 'web-search')",
+                   "INSERT 0 1", "a first slug must insert");
+    {
+        auto duplicate = execute(connection.get(), "INSERT INTO skills (id, slug) VALUES ('s2', 'web-search')");
+        const char *state = PQresultErrorField(duplicate.get(), PG_DIAG_SQLSTATE);
+        const char *detail = PQresultErrorField(duplicate.get(), PG_DIAG_MESSAGE_DETAIL);
+        const char *constraint = PQresultErrorField(duplicate.get(), PG_DIAG_CONSTRAINT_NAME);
+        const char *primary = PQresultErrorField(duplicate.get(), PG_DIAG_MESSAGE_PRIMARY);
+        check(state && std::string(state) == "23505", std::string("a duplicate slug must fail with 23505: ") +
+              PQresultErrorMessage(duplicate.get()));
+        check(primary && std::string(primary) ==
+                  "duplicate key value violates unique constraint \"skills_slug_key\"",
+              std::string("unique_violation message must match PostgreSQL's: ") + (primary ? primary : "none"));
+        check(detail && std::string(detail).rfind("Key (slug)=(web-search) already exists", 0) == 0,
+              std::string("unique_violation must carry the key as DETAIL: ") + (detail ? detail : "none"));
+        check(constraint && std::string(constraint) == "skills_slug_key",
+              "unique_violation must name the constraint");
+    }
+    {
+        const char *values[] = {"s3", "web-search"};
+        Result duplicate(PQexecParams(connection.get(), "INSERT INTO skills (id, slug) VALUES ($1, $2)",
+                                      2, nullptr, values, nullptr, nullptr, 0));
+        const char *state = PQresultErrorField(duplicate.get(), PG_DIAG_SQLSTATE);
+        check(state && std::string(state) == "23505", "extended-protocol duplicates must fail with 23505");
+    }
+    expect_command(connection.get(), "INSERT INTO skills (id, slug) VALUES ('s5', 'other')",
+                   "INSERT 0 1", "another slug must insert");
+    expect_sqlstate(connection.get(), "UPDATE skills SET slug = 'web-search' WHERE id = 's5'",
+                    "23505", "an UPDATE making a duplicate must fail");
+    expect_command(connection.get(),
+                   "INSERT INTO skills (id, slug) VALUES ('s4', 'web-search') ON CONFLICT DO NOTHING",
+                   "INSERT 0 0", "ON CONFLICT DO NOTHING must skip a duplicate");
+    expect_cell(connection.get(), "SELECT COUNT(*) FROM skills WHERE slug = 'web-search'", 0, 0, "1",
+                "only the first web-search row must exist");
+    {
+        // The source branch is another branch: the same slug is fine there.
+        auto source = setup.checkout("main");
+        source.execute("INSERT INTO skills (id, slug) VALUES ('m1', 'web-search')", {});
+    }
 
     auto physical = execute(connection.get(), "SELECT * FROM _chronos_b_interval_orders");
     check(PQresultStatus(physical.get()) == PGRES_FATAL_ERROR,
