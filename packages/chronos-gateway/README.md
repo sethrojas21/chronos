@@ -195,7 +195,13 @@ Each workspace chooses how table structure is versioned with
   Chronos index; a partial index (`WHERE`) becomes a plain index on the same
   columns. These run outside the client's transaction: the table or index
   exists on every branch as soon as the statement returns, and `ROLLBACK` does
-  not remove it. `UNIQUE` in `CREATE TABLE` is accepted as a lookup index on the same columns, named per schema like other indexes, but it is **not enforced**: a branch can hold duplicate values and merges don't check them. Other DDL (`ALTER`, `DROP`, unique or expression indexes,
+  not remove it. `UNIQUE` in `CREATE TABLE` (on a column or as `UNIQUE (a, b)`) is
+  enforced within each branch: an `INSERT` or `UPDATE` that would leave two
+  rows with the same non-NULL values on one branch fails with SQLSTATE `23505`
+  (`ON CONFLICT DO NOTHING` skips the row instead), and a merge that would do so
+  in the target is reported as a conflict. NULLs never conflict, and the same
+  value on two branches is fine. Each constraint gets a Chronos index named as
+  PostgreSQL names the constraint (`table_col_key`), per schema. Other DDL (`ALTER`, `DROP`, unique or expression indexes,
   tables without a primary key, PostgreSQL schemas) is refused with SQLSTATE
   `0A000`. The translation is `chronos_core.control.ddl`.
 

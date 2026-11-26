@@ -140,6 +140,16 @@ the supplied database. No servers are started or stopped by the script.
 Prepare existing SQL tables with `table register --store NAME TABLE --primary-key KEY`;
 repeat `--primary-key` for composite keys. `table create` runs one ordinary CREATE
 TABLE statement before registration; it is not a branch-local schema change.
+`UNIQUE` in `table create` (on a column or as `UNIQUE (a, b)`) is taken out of
+the physical table and declared to Chronos; once the table is registered it is
+enforced within each branch. A write that would leave two rows with the same
+non-NULL values on one branch fails (exit 1, `UniqueViolationError`), and a
+merge that would do so in the target is listed as a conflict and refused. NULLs
+never conflict, and the same value on two branches is fine. For a table created
+without it, pass `--unique COL[,COL...]` (repeatable) to `table register`;
+existing rows on every branch are checked first. Each constraint gets a
+Chronos index named `table_col_key`.
+
 After registration, use the branch-session `query` and `execute` commands for
 managed reads and writes. See [integration](integration.md) before adopting
 application data; direct access to the original table bypasses Chronos.
@@ -167,7 +177,8 @@ chronos table info --store app items
 `table index --store NAME TABLE --column COL` calls `create_index()` on a
 registered table and prints the index; repeat `--column` for a multi-column
 index and pass `--name` to choose its name. Chronos maintains the index on
-every branch. Partial (`WHERE`) and unique indexes are not supported.
+every branch. Partial (`WHERE`) and unique indexes are not supported; declare
+uniqueness with `UNIQUE` in `table create` or `table register --unique`.
 
 ```sh
 chronos table index --store app items --column value --name items_value
